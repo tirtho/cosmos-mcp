@@ -1,0 +1,57 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "resourcePrefix": {
+      "value": "mcp-toolkit"
+    },
+    "location": {
+      "value": "[resourceGroup().location]"
+    },
+    "cosmosEndpoint": {
+      "value": "",
+      "metadata": {
+        "description": "Your Cosmos DB endpoint. Example: https://your-cosmos-account.documents.azure.com:443/"
+      }
+    },
+    "azureAiServiceEndpoint": {
+      "value": "",
+      "metadata": {
+        "description": "Embedding service endpoint URL. Supports Azure AI Services, Azure AI Foundry, or OpenAI."
+      }
+    },
+    "embeddingDeploymentName": {
+      "value": "text-embedding-3-large",
+      "metadata": {
+        "description": "Embedding model deployment name in your Microsoft Foundry project or Azure OpenAI. Common values: text-embedding-3-small, text-embedding-3-large, text-embedding-ada-002"
+      }
+    },
+    "useExistingAcr": {
+      "value": false,
+      "metadata": {
+        "description": "Set to true to use an existing Azure Container Registry instead of creating one"
+      }
+    },
+    "existingAcrName": {
+      "value": "",
+      "metadata": {
+        "description": "Existing Azure Container Registry name (required when useExistingAcr=true)"
+      }
+    },
+    "existingAcrResourceGroup": {
+      "value": "",
+      "metadata": {
+        "description": "Resource group containing the existing ACR (defaults to deployment resource group when empty)"
+      }
+    },
+    "entraAppDisplayName": {
+      "value": "Azure Cosmos DB MCP Toolkit"
+    },
+    "aifProjectResourceId": {
+      "value": "",
+      "metadata": {
+        "description": "Optional: Microsoft Foundry project resource ID for assigning Entra App role. Format: /subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.MachineLearningServices/workspaces/{project}"
+      }
+    }
+  }
+}

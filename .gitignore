@@ -1,0 +1,29 @@
+toolkit/
+deployment-info.json
+*.log
+.env
+
+# .NET build output and local IDE state
+[Bb]in/
+[Oo]bj/
+.vs/
+.vscode/
+artifacts/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Local environment and deployment state
+.env.*
+.azure/
+**/deployment-info.json
+**/appsettings.Development.json
+*.parameters.json
+!*.parameters.template.json
+TestResults/
+coverage/
+test-results/
+*.trx
+*.coverage
+*.coveragexml
