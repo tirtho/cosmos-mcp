@@ -12,6 +12,7 @@ using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.IdentityModel.Tokens;
 using System.IdentityModel.Tokens.Jwt;
 using System.Text;
+using System.Collections.Concurrent;
 using AzureCosmosDB.MCP.Toolkit.Services;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -158,6 +159,13 @@ if (!devBypassAuth && !string.IsNullOrEmpty(tenantId) && !string.IsNullOrEmpty(c
                 {
                     var logger = context.HttpContext.RequestServices.GetRequiredService<ILogger<Program>>();
                     logger.LogInformation("Token validated successfully for user: {User}", context.Principal?.Identity?.Name ?? "Unknown");
+                    logger.LogInformation(
+                        "Validated token identity: oid={ObjectId}, appid={AppId}, azp={AuthorizedParty}, roles={Roles}, scopes={Scopes}",
+                        context.Principal?.FindFirst("oid")?.Value ?? "none",
+                        context.Principal?.FindFirst("appid")?.Value ?? "none",
+                        context.Principal?.FindFirst("azp")?.Value ?? "none",
+                        string.Join(",", context.Principal?.FindAll("roles").Select(claim => claim.Value) ?? Enumerable.Empty<string>()),
+                        string.Join(",", context.Principal?.FindAll("scp").Select(claim => claim.Value) ?? Enumerable.Empty<string>()));
                     return Task.CompletedTask;
                 },
                 OnChallenge = context =>
@@ -176,10 +184,17 @@ if (!devBypassAuth && !string.IsNullOrEmpty(tenantId) && !string.IsNullOrEmpty(c
             };
         });
 
-    // Add authorization with policy for MCP Tool Executor role
+    var trustedPrincipalIds = builder.Configuration["AzureAd:TrustedPrincipalObjectIds"]?
+        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .ToHashSet(StringComparer.OrdinalIgnoreCase) ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+    // Foundry project-managed-identity tokens may omit app-role claims. Keep the role requirement
+    // for normal callers, with an explicit object-id allow-list for the configured Foundry identity.
     builder.Services.AddAuthorization(options =>
     {
-        options.AddPolicy("McpToolExecutor", p => p.RequireRole("Mcp.Tool.Executor"));
+        options.AddPolicy("McpToolExecutor", policy => policy.RequireAssertion(context =>
+            context.User.IsInRole("Mcp.Tool.Executor") ||
+            trustedPrincipalIds.Contains(context.User.FindFirst("oid")?.Value ?? string.Empty)));
 
         options.DefaultPolicy = new AuthorizationPolicyBuilder()
             .RequireAuthenticatedUser()
@@ -397,9 +412,235 @@ public partial class Program
     }
 }
 
-[McpServerToolType]
 public static class CosmosDbTools
 {
+    private sealed record SearchProfile(string TextProperty, string? VectorProperty, string SelectProperties, bool HasFullTextIndex, bool HasVectorIndex, bool SemanticRerankingEnabled);
+    private static readonly ConcurrentDictionary<string, Lazy<Task<SearchProfile>>> SearchProfiles = new(StringComparer.OrdinalIgnoreCase);
+
+    private static bool IsVectorProperty(string propertyName)
+        => propertyName.Contains("embedding", StringComparison.OrdinalIgnoreCase)
+            || propertyName.Contains("vector", StringComparison.OrdinalIgnoreCase);
+
+    private static JsonElement RemoveVectorProperties(JsonElement value)
+    {
+        using var document = JsonDocument.Parse(JsonSerializer.Serialize(value));
+        using var stream = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(stream))
+        {
+            WriteWithoutVectorProperties(writer, document.RootElement);
+        }
+
+        return JsonDocument.Parse(stream.ToArray()).RootElement.Clone();
+    }
+
+    private static void WriteWithoutVectorProperties(Utf8JsonWriter writer, JsonElement value)
+    {
+        switch (value.ValueKind)
+        {
+            case JsonValueKind.Object:
+                writer.WriteStartObject();
+                foreach (var property in value.EnumerateObject())
+                {
+                    if (IsVectorProperty(property.Name)) continue;
+                    writer.WritePropertyName(property.Name);
+                    WriteWithoutVectorProperties(writer, property.Value);
+                }
+                writer.WriteEndObject();
+                break;
+            case JsonValueKind.Array:
+                writer.WriteStartArray();
+                foreach (var item in value.EnumerateArray())
+                    WriteWithoutVectorProperties(writer, item);
+                writer.WriteEndArray();
+                break;
+            default:
+                value.WriteTo(writer);
+                break;
+        }
+    }
+
+    private static string BuildSearchResponse(string searchType, string query, object parameters, IEnumerable<JsonElement> results)
+        => JsonSerializer.Serialize(new
+        {
+            searchType,
+            query,
+            parameters = RemoveVectorProperties(JsonSerializer.SerializeToElement(parameters)),
+            results = results.Select(RemoveVectorProperties)
+        });
+
+    private static bool TryGetResults(string json, out JsonElement results)
+    {
+        using var document = JsonDocument.Parse(json);
+        if (document.RootElement.ValueKind == JsonValueKind.Array)
+        {
+            results = document.RootElement.Clone();
+            return true;
+        }
+
+        if (document.RootElement.TryGetProperty("results", out var wrappedResults) && wrappedResults.ValueKind == JsonValueKind.Array)
+        {
+            results = wrappedResults.Clone();
+            return true;
+        }
+
+        results = default;
+        return false;
+    }
+
+    private static string NormalizeSearchType(string value)
+        => value.Trim().ToLowerInvariant().Replace('-', '_').Replace(' ', '_');
+
+    private static async Task<SearchProfile> GetSearchProfileAsync(CosmosClient client, string databaseId, string containerId)
+    {
+        var key = $"{databaseId}/{containerId}";
+        var lazy = SearchProfiles.GetOrAdd(key, _ => new Lazy<Task<SearchProfile>>(
+            () => LoadSearchProfileAsync(client, databaseId, containerId), LazyThreadSafetyMode.ExecutionAndPublication));
+        return await lazy.Value;
+    }
+
+    private static async Task<SearchProfile> LoadSearchProfileAsync(CosmosClient client, string databaseId, string containerId)
+    {
+        var container = client.GetContainer(databaseId, containerId);
+        var response = await container.ReadContainerAsync();
+        var policyJson = JsonSerializer.SerializeToElement(response.Resource.IndexingPolicy);
+        var policyText = policyJson.GetRawText();
+
+        var sampleIterator = container.GetItemQueryIterator<JsonElement>(new QueryDefinition("SELECT TOP 10 * FROM c"), requestOptions: new QueryRequestOptions { MaxItemCount = 10 });
+        var stringProperties = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var documentProperties = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var vectorCandidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        while (sampleIterator.HasMoreResults)
+        {
+            foreach (var document in await sampleIterator.ReadNextAsync())
+            {
+                if (document.ValueKind != JsonValueKind.Object) continue;
+                foreach (var property in document.EnumerateObject())
+                {
+                    documentProperties.Add(property.Name);
+                    if (property.Value.ValueKind == JsonValueKind.String)
+                        stringProperties[property.Name] = stringProperties.GetValueOrDefault(property.Name) + 1;
+                    if (property.Value.ValueKind == JsonValueKind.Array &&
+                        (property.Name.Contains("vector", StringComparison.OrdinalIgnoreCase) || property.Name.Contains("embedding", StringComparison.OrdinalIgnoreCase)))
+                        vectorCandidates.Add(property.Name);
+                }
+            }
+            break;
+        }
+
+        var textProperty = stringProperties.OrderByDescending(pair => pair.Value).ThenBy(pair => pair.Key).Select(pair => pair.Key).FirstOrDefault() ?? "content";
+        var vectorProperty = vectorCandidates.FirstOrDefault();
+        var selectProperties = string.Join(",", documentProperties.Where(property => !vectorCandidates.Contains(property)));
+        if (string.IsNullOrWhiteSpace(selectProperties)) selectProperties = "id";
+        return new SearchProfile(
+            textProperty,
+            vectorProperty,
+            selectProperties,
+            policyText.Contains("fullText", StringComparison.OrdinalIgnoreCase),
+            vectorProperty is not null && policyText.Contains("vector", StringComparison.OrdinalIgnoreCase),
+            string.Equals(Environment.GetEnvironmentVariable("COSMOS_SEMANTIC_RERANKING_ENABLED"), "true", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [McpServerTool, Description("Searches a Cosmos DB container using the first search type in searchTypes that returns results. Supported types are hybrid, vector, and text; default priority is hybrid,vector,text. Use selectProperties to return only requested fields. The response includes the selected search type, parameterized Cosmos query, and results. Embedding/vector fields are excluded by default.")]
+    internal static async Task<string> Search(
+        CosmosClient client,
+        [Description("Database id containing the container")] string databaseId,
+        [Description("Container id to query")] string containerId,
+        [Description("Natural-language search text")] string searchText,
+        [Description("Comma-separated fields to return, or empty to return complete documents")] string selectProperties = "",
+        [Description("Maximum number of results, default 5")] int n = 5,
+        [Description("Comma-separated search types in priority order: hybrid, vector, text. Default: hybrid,vector,text.")] string searchTypes = "hybrid,vector,text")
+    {
+        if (string.IsNullOrWhiteSpace(databaseId) || string.IsNullOrWhiteSpace(containerId) || string.IsNullOrWhiteSpace(searchText))
+            return JsonSerializer.Serialize(new { error = "Parameters 'databaseId', 'containerId', and 'searchText' are required." });
+        if (n < 1 || n > 50)
+            return JsonSerializer.Serialize(new { error = "Parameter 'n' must be between 1 and 50." });
+
+        var profile = await GetSearchProfileAsync(client, databaseId, containerId);
+        var properties = string.IsNullOrWhiteSpace(selectProperties) ? profile.SelectProperties : selectProperties;
+        var requestedTypes = searchTypes.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(NormalizeSearchType)
+            .Where(type => type is "hybrid" or "vector" or "text")
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (requestedTypes.Count == 0)
+            return JsonSerializer.Serialize(new { error = "searchTypes must contain at least one of: hybrid, vector, text." });
+
+        foreach (var searchType in requestedTypes)
+        {
+            var candidateCount = Math.Min(50, Math.Max(n, 20));
+            string candidateJson;
+            if (searchType == "hybrid" && profile.VectorProperty is not null && profile.HasVectorIndex)
+                candidateJson = await HybridSearch(databaseId, containerId, searchText, profile.TextProperty, profile.VectorProperty, properties, candidateCount);
+            else if (searchType == "vector" && profile.VectorProperty is not null && profile.HasVectorIndex)
+                candidateJson = await VectorSearch(databaseId, containerId, searchText, profile.VectorProperty, properties, candidateCount);
+            else if (searchType == "text")
+                candidateJson = await TextSearch(databaseId, containerId, profile.TextProperty, searchText, n: Math.Min(20, Math.Max(n, 10)), selectProperties: properties);
+            else
+                continue;
+
+            if (!TryGetResults(candidateJson, out var candidateResults) || candidateResults.GetArrayLength() == 0)
+                continue;
+            if (profile.SemanticRerankingEnabled)
+                return await SemanticRerankAsync(client, databaseId, containerId, searchText, candidateJson, n, profile.TextProperty);
+            return candidateJson;
+        }
+
+        return JsonSerializer.Serialize(new { searchTypes = requestedTypes, results = Array.Empty<object>(), message = "No search type returned results." });
+    }
+
+    private static async Task<string> SemanticRerankAsync(CosmosClient client, string databaseId, string containerId, string context, string candidateJson, int topN, string targetPath)
+    {
+        using var candidateDocument = JsonDocument.Parse(candidateJson);
+        var candidateRoot = candidateDocument.RootElement;
+        var candidatesElement = candidateRoot.ValueKind == JsonValueKind.Array
+            ? candidateRoot
+            : candidateRoot.TryGetProperty("results", out var wrappedResults) ? wrappedResults : default;
+        if (candidatesElement.ValueKind != JsonValueKind.Array)
+            return candidateJson;
+
+        var candidates = candidatesElement.EnumerateArray().ToList();
+        if (candidates.Count == 0) return candidateJson;
+
+        var documents = candidates.Select(document => JsonSerializer.Serialize(document)).ToList();
+        SemanticRerankResult result;
+        try
+        {
+            result = await client.GetContainer(databaseId, containerId).SemanticRerankAsync(
+                rerankContext: context,
+                documents: documents,
+                options: new Dictionary<string, dynamic>
+                {
+                    ["return_documents"] = true,
+                    ["top_k"] = topN,
+                    ["sort"] = true,
+                    ["document_type"] = "json",
+                    ["target_paths"] = targetPath
+                });
+        }
+        catch (CosmosException)
+        {
+            return candidateJson;
+        }
+
+        var reranked = result.RerankScores
+            .Take(topN)
+            .Select(score => new
+            {
+                score = score.Score,
+                document = score.Document is null ? null : (object?)RemoveVectorProperties(JsonSerializer.Deserialize<JsonElement>(score.Document))
+            });
+        return JsonSerializer.Serialize(new
+        {
+            searchType = "semantic_reranked",
+            baseSearch = candidateRoot.ValueKind == JsonValueKind.Object && candidateRoot.TryGetProperty("searchType", out var baseType) ? baseType.GetString() : "unknown",
+            query = candidateRoot.ValueKind == JsonValueKind.Object && candidateRoot.TryGetProperty("query", out var query) ? query.GetString() : null,
+            parameters = candidateRoot.ValueKind == JsonValueKind.Object && candidateRoot.TryGetProperty("parameters", out var parameters)
+                ? RemoveVectorProperties(parameters)
+                : default,
+            results = reranked
+        });
+    }
+
     // Environment variables used:
     // COSMOS_ENDPOINT - Cosmos DB account endpoint
     // OPENAI_ENDPOINT - Azure AI Services account endpoint, e.g. https://<resource>.cognitiveservices.azure.com/
@@ -553,13 +794,14 @@ public static class CosmosDbTools
         }
     }
 
-    [McpServerTool, Description("Select TOP N documents where a given property contains the provided search string. N must be between 1 and 20.")]
+    [McpServerTool, Description("Select TOP N documents whose specified string property contains the search phrase, case-insensitive, without requiring a full-text index. Use selectProperties to return only requested fields; id is returned by default and embeddings are excluded. Call get_approximate_schema first when the property name is unknown. N must be between 1 and 20.")]
     public static async Task<string> TextSearch(
         [Description("Database id containing the container")] string databaseId,
         [Description("Container id to query")] string containerId,
-        [Description("Document property to search, e.g. name or profile.name")] string property,
+        [Description("Exact string property path to search, e.g. name, subject, content, or profile.name. Derive it from get_approximate_schema; do not invent it.")] string property,
         [Description("Search term to look for within the property")] string searchPhrase,
-        [Description("Number of documents to return (1-20, default 10)")] int n = 10)
+        [Description("Number of documents to return (1-20, default 10)")] int n = 10,
+        [Description("Comma-separated fields to return, or empty to return id only")] string selectProperties = "")
     {
         try
         {
@@ -581,6 +823,13 @@ public static class CosmosDbTools
                 return JsonSerializer.Serialize(new { error = "Parameter 'n' must be a whole number between 1 and 20." });
             }
 
+            var properties = string.IsNullOrWhiteSpace(selectProperties) ? "id" : selectProperties;
+            if (properties.Trim() == "*" || properties.Contains("*"))
+                return JsonSerializer.Serialize(new { error = "Parameter 'selectProperties' cannot contain '*' wildcard." });
+            var propertyPattern = new Regex(@"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$");
+            if (properties.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Any(p => !propertyPattern.IsMatch(p)))
+                return JsonSerializer.Serialize(new { error = "Invalid property name in selectProperties." });
+
             // Basic validation to avoid injection in the property path: allow letters, digits, underscore and dot segments.
             var propPattern = new Regex(@"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$");
             if (!propPattern.IsMatch(property))
@@ -595,7 +844,8 @@ public static class CosmosDbTools
             });
 
             var container = client.GetContainer(databaseId, containerId);
-            var queryText = $"SELECT TOP {n} * FROM c WHERE FullTextContains(c.{property}, @searchPhrase) ";
+            var projection = string.Join(", ", properties.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Select(p => $"c.{p}"));
+            var queryText = $"SELECT TOP {n} {projection}, 1 AS score FROM c WHERE IS_STRING(c.{property}) AND CONTAINS(c.{property}, @searchPhrase, true) ORDER BY score DESC";
             var query = new QueryDefinition(queryText).WithParameter("@searchPhrase", searchPhrase);
 
             var iterator = container.GetItemQueryIterator<dynamic>(query, requestOptions: new QueryRequestOptions { MaxItemCount = n });
@@ -611,8 +861,8 @@ public static class CosmosDbTools
                 }
             }
 
-            var jsonArray = "[" + string.Join(",", jsonDocs) + "]";
-            return jsonArray;
+            using var resultDocument = JsonDocument.Parse("[" + string.Join(",", jsonDocs) + "]");
+            return BuildSearchResponse("text", queryText, new { searchPhrase, property, selectProperties = properties, n }, resultDocument.RootElement.EnumerateArray());
         }
         catch (CosmosException cex)
         {
@@ -663,7 +913,8 @@ public static class CosmosDbTools
                 var page = await iterator.ReadNextAsync();
                 foreach (var doc in page)
                 {
-                    return doc?.ToString() ?? "{}";
+                    var json = doc?.ToString() ?? "{}";
+                    return JsonSerializer.Serialize(RemoveVectorProperties(JsonSerializer.Deserialize<JsonElement>(json)));
                 }
             }
 
@@ -906,7 +1157,7 @@ public static class CosmosDbTools
 
             // Build vector search query - prepend "c." to vectorProperty as well
             var queryText = $@"
-                SELECT TOP @topN {selectClause}, VectorDistance(c.{vectorProperty}, @embedding) as score
+                SELECT TOP @topN {selectClause}, 1 - VectorDistance(c.{vectorProperty}, @embedding) as score
                 FROM c
                 ORDER BY VectorDistance(c.{vectorProperty}, @embedding)";
 
@@ -931,7 +1182,8 @@ public static class CosmosDbTools
             }
 
             var jsonArray = "[" + string.Join(",", results) + "]";
-            return jsonArray;
+            using var resultDocument = JsonDocument.Parse(jsonArray);
+            return BuildSearchResponse("vector", queryText, new { searchText, vectorProperty, selectProperties, topN, embedding = "@embedding" }, resultDocument.RootElement.EnumerateArray());
         }
         catch (CosmosException cex)
         {
@@ -1061,7 +1313,7 @@ public static class CosmosDbTools
 
             // Hybrid search query using RRF to combine vector and full-text scores
             var queryText = $@"
-                SELECT TOP @topN {selectClause}
+                SELECT TOP @topN {selectClause}, RANK RRF(VectorDistance(c.{vectorProperty}, @embedding), FullTextScore(c.{textProperty}, @searchText)) AS score
                 FROM c
                 ORDER BY RANK RRF(VectorDistance(c.{vectorProperty}, @embedding), FullTextScore(c.{textProperty}, @searchText))";
 
@@ -1087,7 +1339,8 @@ public static class CosmosDbTools
             }
 
             var jsonArray = "[" + string.Join(",", results) + "]";
-            return jsonArray;
+            using var resultDocument = JsonDocument.Parse(jsonArray);
+            return BuildSearchResponse("hybrid", queryText, new { searchText, textProperty, vectorProperty, selectProperties, topN, embedding = "@embedding" }, resultDocument.RootElement.EnumerateArray());
         }
         catch (CosmosException cex)
         {

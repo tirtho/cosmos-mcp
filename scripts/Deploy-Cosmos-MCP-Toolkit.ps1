@@ -62,13 +62,15 @@ function Select-Resource {
     }
 
     if ($Resources.Count -eq 1) {
-        Write-Info "Found one $Label resource: $($Resources[0].name)"
+        $resourceLabel = if ($Resources[0].displayName) { $Resources[0].displayName } else { $Resources[0].name }
+        Write-Info "Found one $Label resource: $resourceLabel"
         return $Resources[0]
     }
 
     Write-Host "Select a $($Label):"
     for ($index = 0; $index -lt $Resources.Count; $index++) {
-        Write-Host "  [$($index + 1)] $($Resources[$index].name)"
+        $resourceLabel = if ($Resources[$index].displayName) { $Resources[$index].displayName } else { $Resources[$index].name }
+        Write-Host "  [$($index + 1)] $resourceLabel"
     }
 
     do {
@@ -80,7 +82,7 @@ function Select-Resource {
 }
 
 function Select-Cosmos-Account {
-    $cosmosAccounts = @(az cosmosdb list --resource-group $script:RESOURCE_GROUP --query "[].{name:name,id:id,documentEndpoint:documentEndpoint}" -o json | ConvertFrom-Json)
+    $cosmosAccounts = @(az cosmosdb list --resource-group $script:RESOURCE_GROUP --query "[].{name:name,id:id,location:location,documentEndpoint:documentEndpoint}" -o json | ConvertFrom-Json)
     if (-not $cosmosAccounts -or $cosmosAccounts.Count -eq 0) {
         Write-Error "No Azure Cosmos DB accounts were found in '$($script:RESOURCE_GROUP)' for subscription '$($script:SUBSCRIPTION_NAME)' ($($script:SUBSCRIPTION_ID))."
         Write-Error "Create or move a Cosmos DB account into this resource group, then run the deployment again."
@@ -90,11 +92,19 @@ function Select-Cosmos-Account {
     $selectedAccount = Select-Resource -Resources $cosmosAccounts -Label "Azure Cosmos DB account"
     $script:CosmosAccountName = $selectedAccount.name
     $script:COSMOS_ENDPOINT = $selectedAccount.documentEndpoint
+    $cosmosRegionSlug = ($selectedAccount.location -replace '\s', '').ToLowerInvariant()
+    $script:COSMOS_SEMANTIC_RERANKER_INFERENCE_ENDPOINT = "https://$($selectedAccount.name).$cosmosRegionSlug.dbinference.azure.com"
     Write-Info "Selected Cosmos DB account: $($script:CosmosAccountName)"
+    Write-Info "Semantic reranker inference endpoint: $($script:COSMOS_SEMANTIC_RERANKER_INFERENCE_ENDPOINT)"
 }
 
 function Select-Foundry-Project {
-    $projects = @(az resource list --resource-group $script:RESOURCE_GROUP --resource-type Microsoft.MachineLearningServices/workspaces --query "[?kind=='Project' || kind=='project'].{name:name,id:id,kind:kind}" -o json | ConvertFrom-Json)
+    # Foundry projects can be represented as either legacy ML workspaces or
+    # current Cognitive Services account project child resources. Neither query
+    # applies a location filter; resources may be in any Azure region.
+    $legacyProjects = @(az resource list --resource-group $script:RESOURCE_GROUP --resource-type Microsoft.MachineLearningServices/workspaces --query "[?kind=='Project' || kind=='project'].{name:name,id:id,kind:kind}" -o json | ConvertFrom-Json)
+    $cognitiveServiceProjects = @(az resource list --resource-group $script:RESOURCE_GROUP --resource-type Microsoft.CognitiveServices/accounts/projects --query "[?kind=='AIServices' || kind=='aiservices' || kind=='Project' || kind=='project'].{name:name,id:id,kind:kind}" -o json | ConvertFrom-Json)
+    $projects = @($legacyProjects + $cognitiveServiceProjects)
     if (-not $projects -or $projects.Count -eq 0) {
         Write-Error "No Microsoft Foundry projects were found in '$($script:RESOURCE_GROUP)' for subscription '$($script:SUBSCRIPTION_NAME)' ($($script:SUBSCRIPTION_ID))."
         Write-Error "Create a Microsoft Foundry project in this resource group, then run the deployment again."
@@ -109,6 +119,9 @@ function Select-Foundry-Project {
     $script:OPENAI_ENDPOINT = $projectDetails.properties.discoveryUrl
     if ([string]::IsNullOrWhiteSpace($script:OPENAI_ENDPOINT)) {
         $script:OPENAI_ENDPOINT = $projectDetails.properties.endpoint
+    }
+    if ([string]::IsNullOrWhiteSpace($script:OPENAI_ENDPOINT) -and $projectDetails.properties.endpoints) {
+        $script:OPENAI_ENDPOINT = $projectDetails.properties.endpoints.'AI Foundry API'
     }
     if ([string]::IsNullOrWhiteSpace($script:OPENAI_ENDPOINT)) {
         Write-Error "The selected Foundry project '$($script:AIF_PROJECT_NAME)' does not expose a discovery or endpoint URL."
@@ -136,6 +149,13 @@ function Select-Embedding-Deployment {
                     endpoint = $account.endpoint
                 }
             }
+        }
+    }
+
+    $duplicateDeploymentNames = @($deployments | Group-Object -Property name | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
+    foreach ($deployment in $deployments) {
+        if ($duplicateDeploymentNames -contains $deployment.name) {
+            $deployment | Add-Member -NotePropertyName displayName -NotePropertyValue "$($deployment.name) (AI service: $($deployment.accountName))"
         }
     }
 
@@ -208,7 +228,7 @@ function Show-Usage {
     Write-Host "  -Environment             Environment used in resource group name rg-eia-<environment>-<suffix>"
     Write-Host "  -Suffix                  Suffix used in resource group name"
     Write-Host "  -Location               Optional region override (defaults to the resource group's region)"
-    Write-Host "  Names are derived as acr-eia-<environment>-<suffix>, ca-eia-<environment>-<suffix>, and entra-eia-<environment>-<suffix>"
+    Write-Host "  Names are derived as acr<environment><suffix>, ca-eia-<environment>-<suffix>, and entra-eia-<environment>-<suffix>"
     Write-Host ""
     exit 1
 }
@@ -221,7 +241,12 @@ function Parse-Arguments {
     $script:ResourceGroup = $script:RESOURCE_GROUP
     $script:LOCATION = $Location
     $script:ENTRA_APP_NAME = "entra-eia-$($script:ENVIRONMENT)-$($script:SUFFIX)"
-    $script:ACR_NAME = "acr-eia-$($script:ENVIRONMENT)-$($script:SUFFIX)"
+    # ACR names are globally unique and allow only lowercase letters and numbers.
+    $acrNameSuffix = "$($script:ENVIRONMENT)$($script:SUFFIX)" -replace '[^a-z0-9]', ''
+    $script:ACR_NAME = "acr$acrNameSuffix"
+    if ($script:ACR_NAME.Length -gt 50) {
+        $script:ACR_NAME = $script:ACR_NAME.Substring(0, 50)
+    }
     $script:ContainerAppName = "ca-eia-$($script:ENVIRONMENT)-$($script:SUFFIX)"
     $script:COSMOS_RESOURCE_GROUP = $script:RESOURCE_GROUP
     $script:ACR_RESOURCE_GROUP = $script:RESOURCE_GROUP
@@ -803,15 +828,10 @@ function Assign-Current-User-Role {
 }
 
 function Check-Prerequisites {
-    Write-Info "Checking prerequisites (az-cli, docker)..."
+    Write-Info "Checking prerequisites (az-cli, ACR build)..."
 
     if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
         Write-Error "Azure CLI is not installed. Please install it from https://docs.microsoft.com/en-us/cli/azure/install-azure-cli"
-        exit 1
-    }
-
-    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-        Write-Error "Docker is not installed. Please install Docker Desktop."
         exit 1
     }
 
@@ -879,29 +899,24 @@ function Verify-Resource-Group {
 }
 
 function Deploy-Infrastructure {
-    Write-Info "Checking if Container App exists..."
-    
-    try {
-        $existingApp = az containerapp show --name $ContainerAppName --resource-group $ResourceGroup 2>$null | ConvertFrom-Json
-        if ($existingApp) {
-            Write-Info "Container App already exists, skipping infrastructure deployment"
-            $script:SKIP_INFRA = $true
-            return
-        }
-    }
-    catch {
-        # Container app doesn't exist, need to deploy infrastructure
-        $script:SKIP_INFRA = $false
-    }
-
-    Write-Info "Creating Azure Container resources..."
-    Write-Info "Note: Initial deployment may show as 'Failed' - this is expected and will be fixed after ACR permissions are assigned"
+    Write-Info "Applying Azure Container resources..."
+    Write-Info "Existing resources will be reconciled with the Bicep template."
 
     if ($script:USE_EXISTING_ACR) {
-        az deployment group create --resource-group $script:RESOURCE_GROUP --template-file "infrastructure/main.bicep" --parameters "containerAppName=$($script:ContainerAppName)" "cosmosEndpoint=$($script:COSMOS_ENDPOINT)" "azureAiServiceEndpoint=$($script:OPENAI_ENDPOINT)" "embeddingDeploymentName=$($script:EMBEDDING_DEPLOYMENT)" "useExistingAcr=true" "existingAcrName=$($script:ACR_NAME)" "existingAcrResourceGroup=$($script:ACR_RESOURCE_GROUP)" --output table
+        az deployment group create --resource-group $script:RESOURCE_GROUP --template-file "infrastructure/main.bicep" --parameters "containerAppName=$($script:ContainerAppName)" "cosmosEndpoint=$($script:COSMOS_ENDPOINT)" "azureAiServiceEndpoint=$($script:OPENAI_ENDPOINT)" "embeddingDeploymentName=$($script:EMBEDDING_DEPLOYMENT)" "cosmosSemanticRerankerInferenceEndpoint=$($script:COSMOS_SEMANTIC_RERANKER_INFERENCE_ENDPOINT)" "useExistingAcr=true" "existingAcrName=$($script:ACR_NAME)" "existingAcrResourceGroup=$($script:ACR_RESOURCE_GROUP)" --output table
     }
     else {
-        az deployment group create --resource-group $script:RESOURCE_GROUP --template-file "infrastructure/main.bicep" --parameters "containerAppName=$($script:ContainerAppName)" "containerRegistryName=$($script:ACR_NAME)" "cosmosEndpoint=$($script:COSMOS_ENDPOINT)" "azureAiServiceEndpoint=$($script:OPENAI_ENDPOINT)" "embeddingDeploymentName=$($script:EMBEDDING_DEPLOYMENT)" --output table
+        az deployment group create --resource-group $script:RESOURCE_GROUP --template-file "infrastructure/main.bicep" --parameters "containerAppName=$($script:ContainerAppName)" "containerRegistryName=$($script:ACR_NAME)" "cosmosEndpoint=$($script:COSMOS_ENDPOINT)" "azureAiServiceEndpoint=$($script:OPENAI_ENDPOINT)" "embeddingDeploymentName=$($script:EMBEDDING_DEPLOYMENT)" "cosmosSemanticRerankerInferenceEndpoint=$($script:COSMOS_SEMANTIC_RERANKER_INFERENCE_ENDPOINT)" --output table
+    }
+
+    $deploymentExitCode = $LASTEXITCODE
+    if ($deploymentExitCode -ne 0) {
+        $deployedApp = az containerapp show --name $ContainerAppName --resource-group $ResourceGroup 2>$null | ConvertFrom-Json
+        if (-not $deployedApp) {
+            throw "Azure Container resources deployment failed with exit code $deploymentExitCode and no Container App was created."
+        }
+
+        Write-Warn "Infrastructure deployment returned exit code $deploymentExitCode, but the Container App exists. Continuing so permissions and the application image can be applied."
     }
 
     Write-Info "Azure Container resources deployment completed!"
@@ -926,21 +941,14 @@ function Get-Deployment-Outputs {
 }
 
 function Build-And-Push-Image {
-    Write-Info "Building and pushing container image..."
+    Write-Info "Building and pushing container image with Azure Container Registry..."
 
     # Extract ACR name from login server
     $ACR_NAME = $script:CONTAINER_REGISTRY -replace '\.azurecr\.io$', ''
     Write-Info "Logging into ACR: $ACR_NAME"
 
     try {
-        # Login to ACR - specify resource group to avoid auto-discovery issues
-        az acr login --name $ACR_NAME --resource-group $script:ACR_RESOURCE_GROUP
-        
-        if ($LASTEXITCODE -ne 0) {
-            throw "ACR login failed with exit code $LASTEXITCODE"
-        }
-
-        # Build image
+        # Build remotely in ACR so Docker Desktop is not required locally.
         $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
         $IMAGE_TAG = "$($script:CONTAINER_REGISTRY)/mcp-toolkit:$timestamp"
 
@@ -949,21 +957,11 @@ function Build-And-Push-Image {
         Push-Location $rootDir
         
         try {
-            Write-Info "Building .NET application from: $(Get-Location)"
-            dotnet publish src/AzureCosmosDB.MCP.Toolkit/AzureCosmosDB.MCP.Toolkit.csproj -c Release -o src/AzureCosmosDB.MCP.Toolkit/bin/publish
-
             Write-Info "Building image: $IMAGE_TAG"
-            docker build --platform linux/amd64 -t $IMAGE_TAG -f Dockerfile.runtime .
+            az acr build --registry $ACR_NAME --resource-group $script:ACR_RESOURCE_GROUP --image "mcp-toolkit:$timestamp" --file Dockerfile .
             
             if ($LASTEXITCODE -ne 0) {
-                throw "Docker build failed with exit code $LASTEXITCODE"
-            }
-
-            Write-Info "Pushing image: $IMAGE_TAG"
-            docker push $IMAGE_TAG
-            
-            if ($LASTEXITCODE -ne 0) {
-                throw "Docker push failed with exit code $LASTEXITCODE"
+                throw "Azure Container Registry build failed with exit code $LASTEXITCODE"
             }
 
             $script:IMAGE_TAG = $IMAGE_TAG
@@ -978,13 +976,11 @@ function Build-And-Push-Image {
         Write-Warn ""
         Write-Warn "TROUBLESHOOTING:"
         Write-Warn "1. Check network connectivity to ACR: az acr check-health -n $ACR_NAME --yes"
-        Write-Warn "2. Verify Docker is running: docker ps"
-        Write-Warn "3. If behind a proxy, configure Docker proxy settings"
-        Write-Warn ""
-        Write-Warn "Deployment will continue without updating the container image."
-        Write-Warn "The Container App will keep using its existing image."
+        Write-Warn "2. Verify the ACR build service is available: az acr check-health -n $ACR_NAME --yes"
+        Write-Warn "3. If behind a proxy, verify Azure CLI connectivity"
         Write-Warn ""
         $script:IMAGE_TAG = $null
+        throw "Container image build or push failed. Deployment cannot continue with the existing image."
     }
 }
 
@@ -1060,6 +1056,11 @@ function Update-Container-App {
     
     if ($embeddingDeployment) {
         $envVars += "OPENAI_EMBEDDING_DEPLOYMENT=$embeddingDeployment"
+    }
+
+    if ($script:COSMOS_SEMANTIC_RERANKER_INFERENCE_ENDPOINT) {
+        $envVars += "AZURE_COSMOS_SEMANTIC_RERANKER_INFERENCE_ENDPOINT=$($script:COSMOS_SEMANTIC_RERANKER_INFERENCE_ENDPOINT)"
+        $envVars += "COSMOS_SEMANTIC_RERANKING_ENABLED=true"
     }
 
     if ($script:AIF_PROJECT_RESOURCE_ID) {
@@ -1312,6 +1313,18 @@ function Assign-Cosmos-RBAC {
     # Export variables for use in deployment summary
     $script:ACA_MI_PRINCIPAL_ID = $ACA_MI_PRINCIPAL_ID
     $script:ACA_MI_DISPLAY_NAME = $ACA_MI_DISPLAY_NAME
+
+    Write-Info "Assigning Semantic Reranker User role to Container App Managed Identity..."
+    $cosmosArmScope = "/subscriptions/$subscriptionId/resourceGroups/$($script:COSMOS_RESOURCE_GROUP)/providers/Microsoft.DocumentDB/databaseAccounts/$($script:CosmosAccountName)"
+    $semanticRoleId = "6c74a7c5-4a87-40f9-bb03-61e49aecbc78"
+    $semanticAssignment = az role assignment list --assignee-object-id $ACA_MI_PRINCIPAL_ID --scope $cosmosArmScope --query "[?roleDefinitionId=='/subscriptions/$subscriptionId/providers/Microsoft.Authorization/roleDefinitions/$semanticRoleId'] | [0].id" -o tsv
+    if ([string]::IsNullOrWhiteSpace($semanticAssignment)) {
+        az role assignment create --role $semanticRoleId --assignee-object-id $ACA_MI_PRINCIPAL_ID --assignee-principal-type ServicePrincipal --scope $cosmosArmScope --output none
+        Write-Info "Semantic Reranker User role assigned successfully."
+    }
+    else {
+        Write-Info "Semantic Reranker User role assignment already exists."
+    }
 }
 
 function Assign-AI-Foundry-RBAC {
@@ -1486,18 +1499,10 @@ function Test-MCP-Server-Health {
         Write-Info "Health check attempt $i of $maxRetries..."
         
         try {
-            # Test basic connectivity with longer timeout
-            $response = Invoke-WebRequest -Uri "$($script:CONTAINER_APP_URL)/" -UseBasicParsing -TimeoutSec 30
-            Write-Info "[OK] MCP server is responding! Status: $($response.StatusCode)"
-            
-            # Test health endpoint if available
-            try {
-                $healthResponse = Invoke-WebRequest -Uri "$($script:CONTAINER_APP_URL)/health" -UseBasicParsing -TimeoutSec 10
-                Write-Info "[OK] Health endpoint responding: $($healthResponse.StatusCode)"
-            }
-            catch {
-                Write-Info "[WARN] Health endpoint not accessible, but main server is running"
-            }
+            # Probe the anonymous health endpoint directly so a missing root route cannot mask app health.
+            $healthResponse = Invoke-WebRequest -Uri "$($script:CONTAINER_APP_URL)/health" -UseBasicParsing -TimeoutSec 30
+            Write-Info "[OK] Health endpoint responding: $($healthResponse.StatusCode)"
+            Write-Info "[OK] MCP server is responding!"
             
             # Test MCP protocol endpoint
             try {

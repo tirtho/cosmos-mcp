@@ -6,6 +6,7 @@ namespace AzureCosmosDB.MCP.Toolkit.Controllers;
 
 [ApiController]
 [Route("api/[controller]")]
+[Route("health")]
 public class HealthController : ControllerBase
 {
     private readonly AuthenticationService _authService;

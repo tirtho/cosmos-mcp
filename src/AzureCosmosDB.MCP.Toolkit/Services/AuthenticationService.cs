@@ -10,12 +10,18 @@ namespace AzureCosmosDB.MCP.Toolkit.Services
         private readonly IHttpContextAccessor _httpContextAccessor;
         private readonly ILogger<AuthenticationService> _logger;
         private readonly IConfiguration _configuration;
+        private readonly IHostEnvironment _environment;
 
-        public AuthenticationService(IHttpContextAccessor httpContextAccessor, ILogger<AuthenticationService> logger, IConfiguration configuration)
+        public AuthenticationService(
+            IHttpContextAccessor httpContextAccessor,
+            ILogger<AuthenticationService> logger,
+            IConfiguration configuration,
+            IHostEnvironment environment)
         {
             _httpContextAccessor = httpContextAccessor;
             _logger = logger;
             _configuration = configuration;
+            _environment = environment;
         }
 
         /// <summary>
@@ -89,10 +95,7 @@ namespace AzureCosmosDB.MCP.Toolkit.Services
         /// <returns>True if authentication should be bypassed</returns>
         private bool IsAuthenticationBypassed()
         {
-            var isDevelopment = string.Equals(
-                _configuration["ASPNETCORE_ENVIRONMENT"],
-                "Development",
-                StringComparison.OrdinalIgnoreCase);
+            var isDevelopment = _environment.IsDevelopment();
 
             return isDevelopment && (Environment.GetEnvironmentVariable("DEV_BYPASS_AUTH") == "true" ||
                    _configuration.GetValue<bool>("DevelopmentMode:BypassAuthentication"));

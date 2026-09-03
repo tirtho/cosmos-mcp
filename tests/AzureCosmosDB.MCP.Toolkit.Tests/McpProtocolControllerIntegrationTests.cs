@@ -20,7 +20,7 @@ public class McpProtocolControllerIntegrationTests : IClassFixture<McpTestApplic
     [Fact]
     public async Task ToolsCall_Should_Reject_Missing_Params()
     {
-        var response = await _client.PostAsJsonAsync("/mcp", new
+        var response = await _client.PostAsJsonAsync("/mcp/http", new
         {
             jsonrpc = "2.0",
             id = 1,
@@ -38,7 +38,7 @@ public class McpProtocolControllerIntegrationTests : IClassFixture<McpTestApplic
     [Fact]
     public async Task ToolsCall_Should_Reject_Unexpected_Argument_Properties()
     {
-        var response = await _client.PostAsJsonAsync("/mcp", new
+        var response = await _client.PostAsJsonAsync("/mcp/http", new
         {
             jsonrpc = "2.0",
             id = 1,
@@ -64,7 +64,7 @@ public class McpProtocolControllerIntegrationTests : IClassFixture<McpTestApplic
     [Fact]
     public async Task ToolsCall_Should_Reject_Wrong_Argument_Types()
     {
-        var response = await _client.PostAsJsonAsync("/mcp", new
+        var response = await _client.PostAsJsonAsync("/mcp/http", new
         {
             jsonrpc = "2.0",
             id = 1,
@@ -91,7 +91,7 @@ public class McpProtocolControllerIntegrationTests : IClassFixture<McpTestApplic
     [Fact]
     public async Task ToolsList_Should_Advertise_Closed_Schemas()
     {
-        var response = await _client.PostAsJsonAsync("/mcp", new
+        var response = await _client.PostAsJsonAsync("/mcp/http", new
         {
             jsonrpc = "2.0",
             id = 1,

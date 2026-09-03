@@ -11,6 +11,14 @@ public sealed class McpToolRequestValidator
         new Dictionary<string, ToolSchema>(StringComparer.OrdinalIgnoreCase)
         {
             ["list_databases"] = new(new Dictionary<string, ToolArgumentSchema>(StringComparer.Ordinal)),
+            ["search"] = new(new Dictionary<string, ToolArgumentSchema>(StringComparer.Ordinal)
+            {
+                ["databaseId"] = ToolArgumentSchema.String(required: true, maxLength: 256),
+                ["containerId"] = ToolArgumentSchema.String(required: true, maxLength: 256),
+                ["searchText"] = ToolArgumentSchema.String(required: true, maxLength: 2048),
+                ["selectProperties"] = ToolArgumentSchema.String(required: false, maxLength: 512),
+                ["n"] = ToolArgumentSchema.Integer(required: false, minValue: 1, maxValue: 50)
+            }),
             ["list_collections"] = new(new Dictionary<string, ToolArgumentSchema>(StringComparer.Ordinal)
             {
                 ["databaseId"] = ToolArgumentSchema.String(required: true, maxLength: 256)

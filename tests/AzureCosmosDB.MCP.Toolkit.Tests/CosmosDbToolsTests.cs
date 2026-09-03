@@ -115,8 +115,8 @@ public class CosmosDbToolsTests
         
         // Assert
         result.Should().NotBeNull();
-        var errorMessage = JsonSerializer.Serialize(result);
-        errorMessage.Should().Contain("cannot contain '*' wildcard");
+        var errorMessage = JsonSerializer.Deserialize<JsonElement>(JsonSerializer.Serialize(result));
+        errorMessage.GetProperty("error").GetString().Should().Contain("cannot contain '*' wildcard");
     }
 
     [Fact]

@@ -236,7 +236,7 @@ public class CosmosDbToolsService
             _logger.LogInformation("Text search for '{SearchPhrase}' in {DatabaseId}/{ContainerId} property {Property}", searchPhrase, databaseId, containerId, property);
 
             var container = _cosmosClient.GetContainer(databaseId, containerId);
-            var queryText = $"SELECT TOP {n} * FROM c WHERE FullTextContains(c.{property}, @searchPhrase) ";
+            var queryText = $"SELECT TOP {n} * FROM c WHERE IS_STRING(c.{property}) AND CONTAINS(c.{property}, @searchPhrase, true) ";
             var query = new QueryDefinition(queryText).WithParameter("@searchPhrase", searchPhrase);
 
             using var streamIterator = container.GetItemQueryStreamIterator(

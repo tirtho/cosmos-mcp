@@ -14,11 +14,11 @@ WORKDIR /src
 COPY ["src/AzureCosmosDB.MCP.Toolkit/AzureCosmosDB.MCP.Toolkit.csproj", "src/AzureCosmosDB.MCP.Toolkit/"]
 COPY ["Directory.Build.props", "./"]
 
-# Restore dependencies in a separate layer (cached unless project file changes)
-RUN dotnet restore "src/AzureCosmosDB.MCP.Toolkit/AzureCosmosDB.MCP.Toolkit.csproj"
-
 # Now copy the rest of the source code
 COPY src/ src/
+
+# Restore after all source files are present so the build uses a complete Linux restore state.
+RUN dotnet restore "src/AzureCosmosDB.MCP.Toolkit/AzureCosmosDB.MCP.Toolkit.csproj"
 
 # Build the application
 WORKDIR "/src/src/AzureCosmosDB.MCP.Toolkit"

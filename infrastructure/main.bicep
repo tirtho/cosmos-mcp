@@ -50,6 +50,9 @@ param azureAiServiceEndpoint string = ''
 @description('Azure OpenAI embedding deployment name')
 param embeddingDeploymentName string = ''
 
+@description('Cosmos DB semantic reranker inference endpoint URL')
+param cosmosSemanticRerankerInferenceEndpoint string = ''
+
 // NOTE: Entra App creation has been moved to the Setup-Permissions.ps1 script
 // for better reliability. The script will create the app if it doesn't exist.
 
@@ -146,6 +149,14 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             {
               name: 'OPENAI_EMBEDDING_DEPLOYMENT'
               value: embeddingDeploymentName
+            }
+            {
+              name: 'AZURE_COSMOS_SEMANTIC_RERANKER_INFERENCE_ENDPOINT'
+              value: cosmosSemanticRerankerInferenceEndpoint
+            }
+            {
+              name: 'COSMOS_SEMANTIC_RERANKING_ENABLED'
+              value: 'true'
             }
             // NOTE: AzureAd__ClientId and AzureAd__Audience will be set by deployment script
             // after the Entra app is created
