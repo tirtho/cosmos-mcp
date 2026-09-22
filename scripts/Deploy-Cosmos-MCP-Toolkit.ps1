@@ -882,9 +882,17 @@ function Verify-Resource-Group {
         Write-Info "Using resource group region: $($script:LOCATION)"
     }
     else {
-        $script:LOCATION = $Location
+        $script:LOCATION = $Location.Trim().ToLowerInvariant()
         Write-Info "Resource group verified successfully: $($script:RESOURCE_GROUP)"
         Write-Warn "Using explicit location override '$($script:LOCATION)' instead of resource group region '$($resourceGroupDetails.location)'."
+    }
+
+    $deployableRegions = Get-ContainerAppsRegions
+    $requestedRegion = $deployableRegions | Where-Object { $_.Name -eq $script:LOCATION } | Select-Object -First 1
+    if (-not $requestedRegion) {
+        Write-Warn "The requested region '$($script:LOCATION)' is not available for both Azure Container Apps and Azure Container Registry in this subscription."
+        $script:LOCATION = Select-Failover-Location -FailedLocation $script:LOCATION
+        Write-Warn "Using selected region '$($script:LOCATION)'."
     }
 
     if ($script:COSMOS_RESOURCE_GROUP -ne $script:RESOURCE_GROUP) {
@@ -896,6 +904,198 @@ function Verify-Resource-Group {
         }
     }
 
+    Resolve-Existing-ACR
+
+}
+
+function Resolve-Existing-ACR {
+    $existingAcr = az acr show --name $script:ACR_NAME --resource-group $script:ACR_RESOURCE_GROUP -o json 2>$null | ConvertFrom-Json
+    if ($existingAcr) {
+        $script:USE_EXISTING_ACR = $true
+        Write-Info "Found existing Azure Container Registry '$($script:ACR_NAME)' in region '$($existingAcr.location)'."
+        Write-Info "The existing registry will be reused; Azure Container Apps can be deployed in '$($script:LOCATION)' without moving the registry."
+    }
+    else {
+        $script:USE_EXISTING_ACR = $false
+        Write-Info "No existing Azure Container Registry '$($script:ACR_NAME)' was found; deployment will create it in '$($script:LOCATION)'."
+    }
+}
+
+function Get-ContainerAppsRegions {
+    $locations = @(az account list-locations --query "[].{name:name,displayName:displayName,latitude:metadata.latitude,longitude:metadata.longitude}" -o json | ConvertFrom-Json)
+    $appLocations = @(az provider show --namespace Microsoft.App --query "resourceTypes[?resourceType=='managedEnvironments'].locations[]" -o tsv 2>$null)
+    $acrLocations = @(az provider show --namespace Microsoft.ContainerRegistry --query "resourceTypes[?resourceType=='registries'].locations[]" -o tsv 2>$null)
+    $appRegionKeys = @($appLocations | ForEach-Object { ([string]$_).ToLowerInvariant() -replace '[^a-z0-9]', '' } | Where-Object { $_ })
+    $acrRegionKeys = @($acrLocations | ForEach-Object { ([string]$_).ToLowerInvariant() -replace '[^a-z0-9]', '' } | Where-Object { $_ })
+
+    $regions = foreach ($location in $locations) {
+        $regionKey = ([string]$location.name).ToLowerInvariant() -replace '[^a-z0-9]', ''
+        $latitude = 0.0
+        $longitude = 0.0
+        if ([double]::TryParse([string]$location.latitude, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$latitude) -and
+            [double]::TryParse([string]$location.longitude, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$longitude) -and
+            (($appRegionKeys.Count -eq 0) -or ($appRegionKeys -contains $regionKey)) -and
+            (($acrRegionKeys.Count -eq 0) -or ($acrRegionKeys -contains $regionKey))) {
+            [pscustomobject]@{
+                Name = [string]$location.name
+                DisplayName = [string]$location.displayName
+                Latitude = $latitude
+                Longitude = $longitude
+            }
+        }
+    }
+
+    return @($regions)
+}
+
+function Get-RegionDistanceKm {
+    param(
+        [double]$Latitude1,
+        [double]$Longitude1,
+        [double]$Latitude2,
+        [double]$Longitude2
+    )
+
+    $earthRadiusKm = 6371
+    $latitudeDelta = ($Latitude2 - $Latitude1) * [Math]::PI / 180
+    $longitudeDelta = ($Longitude2 - $Longitude1) * [Math]::PI / 180
+    $latitude1Radians = $Latitude1 * [Math]::PI / 180
+    $latitude2Radians = $Latitude2 * [Math]::PI / 180
+    $a = [Math]::Pow([Math]::Sin($latitudeDelta / 2), 2) +
+        [Math]::Cos($latitude1Radians) * [Math]::Cos($latitude2Radians) * [Math]::Pow([Math]::Sin($longitudeDelta / 2), 2)
+    return 2 * $earthRadiusKm * [Math]::Atan2([Math]::Sqrt($a), [Math]::Sqrt(1 - $a))
+}
+
+function Select-Failover-Location {
+    param([Parameter(Mandatory = $true)][string]$FailedLocation)
+
+    $regions = Get-ContainerAppsRegions
+    $failedRegion = $regions | Where-Object { $_.Name -eq $FailedLocation } | Select-Object -First 1
+    if (-not $failedRegion) {
+        Write-Warn "Could not determine coordinates for '$FailedLocation'."
+    }
+
+    $candidates = @($regions |
+        Where-Object { $_.Name -ne $FailedLocation } |
+        ForEach-Object {
+            $distance = if ($failedRegion) {
+                Get-RegionDistanceKm -Latitude1 $failedRegion.Latitude -Longitude1 $failedRegion.Longitude -Latitude2 $_.Latitude -Longitude2 $_.Longitude
+            } else {
+                [double]::PositiveInfinity
+            }
+            $_ | Add-Member -NotePropertyName DistanceKm -NotePropertyValue $distance -PassThru
+        } |
+        Sort-Object DistanceKm |
+        Select-Object -First 3)
+
+    Write-Host ""
+    Write-Host "The requested deployment region '$FailedLocation' is unavailable or does not currently have sufficient capacity for the required resources."
+    if ($candidates.Count -gt 0) {
+        Write-Host "Select a nearby eligible Azure region:"
+        for ($index = 0; $index -lt $candidates.Count; $index++) {
+            Write-Host "  [$($index + 1)] $($candidates[$index].Name) ($($candidates[$index].DisplayName), $([Math]::Round($candidates[$index].DistanceKm)) km away)"
+        }
+    }
+    Write-Host "  [O] Enter another Azure region name"
+
+    do {
+        $selection = (Read-Host "Enter a selection")
+        if ($selection -match '^[1-3]$' -and [int]$selection -le $candidates.Count) {
+            return $candidates[[int]$selection - 1].Name
+        }
+        if ($selection -match '^[Oo]$') {
+            $customRegion = (Read-Host "Enter the Azure region name (for example, eastus2)").Trim().ToLowerInvariant()
+            if (-not [string]::IsNullOrWhiteSpace($customRegion) -and $customRegion -ne $FailedLocation) {
+                $customRegionKey = $customRegion -replace '[^a-z0-9]', ''
+                $eligibleRegion = $regions | Where-Object { (($_.Name -replace '[^a-zA-Z0-9]', '').ToLowerInvariant()) -eq $customRegionKey } | Select-Object -First 1
+                if ($eligibleRegion) {
+                    return $eligibleRegion.Name
+                }
+                Write-Warn "'$customRegion' is not listed as an eligible Microsoft.App managed environment region. Choose a listed region or enter another valid region."
+            }
+        }
+        Write-Warn "Enter one of the displayed numbers or O."
+    } while ($true)
+}
+
+function Get-Deployment-Resource-Snapshot {
+    $acr = az acr show --name $script:ACR_NAME --resource-group $script:ACR_RESOURCE_GROUP -o json 2>$null | ConvertFrom-Json
+    $environment = az containerapp env show --name 'mcp-toolkit-env' --resource-group $script:RESOURCE_GROUP -o json 2>$null | ConvertFrom-Json
+    $containerApp = az containerapp show --name $script:ContainerAppName --resource-group $script:RESOURCE_GROUP -o json 2>$null | ConvertFrom-Json
+
+    return [pscustomobject]@{
+        AcrExists = $null -ne $acr
+        EnvironmentExists = $null -ne $environment
+        EnvironmentState = if ($environment) { [string]$environment.properties.provisioningState } else { $null }
+        ContainerAppExists = $null -ne $containerApp
+    }
+}
+
+function Remove-Failed-Region-Resources {
+    param([Parameter(Mandatory = $true)][object]$Snapshot)
+
+    Write-Info "Rolling back resources from failed region '$($script:LOCATION)'..."
+
+    $containerApp = az containerapp show --name $script:ContainerAppName --resource-group $script:RESOURCE_GROUP -o json 2>$null | ConvertFrom-Json
+    if (-not $Snapshot.ContainerAppExists -and $containerApp) {
+        Write-Info "Removing Container App '$($script:ContainerAppName)'..."
+        az containerapp delete --name $script:ContainerAppName --resource-group $script:RESOURCE_GROUP --yes --output none
+    }
+
+    $environment = az containerapp env show --name 'mcp-toolkit-env' --resource-group $script:RESOURCE_GROUP -o json 2>$null | ConvertFrom-Json
+    if ($environment -and (($Snapshot.EnvironmentExists -eq $false) -or $environment.properties.provisioningState -eq 'Failed')) {
+        $environmentId = $environment.id
+        $environmentApps = @(az containerapp list --resource-group $script:RESOURCE_GROUP --query "[?properties.managedEnvironmentId=='$environmentId'].name" -o tsv 2>$null)
+        if ($environmentApps.Count -eq 0) {
+            Write-Info "Removing failed Container Apps environment 'mcp-toolkit-env'..."
+            az containerapp env delete --name 'mcp-toolkit-env' --resource-group $script:RESOURCE_GROUP --yes --output none
+        } else {
+            throw "The failed Container Apps environment contains existing apps ($($environmentApps -join ', ')); automatic rollback stopped to avoid deleting them."
+        }
+    }
+
+    $acr = az acr show --name $script:ACR_NAME --resource-group $script:ACR_RESOURCE_GROUP -o json 2>$null | ConvertFrom-Json
+    if (-not $Snapshot.AcrExists -and $acr) {
+        Write-Info "Removing ACR '$($script:ACR_NAME)' created by the failed deployment..."
+        az acr delete --name $script:ACR_NAME --resource-group $script:ACR_RESOURCE_GROUP --yes
+    }
+}
+
+function Test-Region-Recovery-Failure {
+    $failureText = "$($script:LAST_INFRASTRUCTURE_ERROR)"
+    if ($failureText -match 'AKSCapacityHeavyUsage|ManagedEnvironmentCapacityHeavyUsage|CapacityHeavyUsage|heavy usage|LocationNotAvailableForResourceType|InvalidLocation|InvalidResourceLocation|location.*not available') {
+        return $true
+    }
+
+    if ($failureText -match 'ManagedEnvironmentNotReadyForAppCreation') {
+        $environment = az containerapp env show --name 'mcp-toolkit-env' --resource-group $script:RESOURCE_GROUP -o json 2>$null | ConvertFrom-Json
+        return $null -ne $environment -and $environment.properties.provisioningState -eq 'Failed'
+    }
+
+    return $false
+}
+
+function Deploy-Infrastructure-With-Region-Recovery {
+    $maxRegionAttempts = 4
+    for ($attempt = 1; $attempt -le $maxRegionAttempts; $attempt++) {
+        $snapshot = Get-Deployment-Resource-Snapshot
+        try {
+            Deploy-Infrastructure
+            return
+        } catch {
+            if (-not (Test-Region-Recovery-Failure)) {
+                throw
+            }
+
+            $nextLocation = Select-Failover-Location -FailedLocation $script:LOCATION
+            Remove-Failed-Region-Resources -Snapshot $snapshot
+            $script:LOCATION = $nextLocation
+            if ($attempt -eq $maxRegionAttempts) {
+                throw "Deployment failed due to capacity after trying $maxRegionAttempts Azure regions."
+            }
+            Write-Warn "Retrying deployment in '$nextLocation' (attempt $($attempt + 1) of $maxRegionAttempts)."
+        }
+    }
 }
 
 function Deploy-Infrastructure {
@@ -903,14 +1103,22 @@ function Deploy-Infrastructure {
     Write-Info "Existing resources will be reconciled with the Bicep template."
 
     if ($script:USE_EXISTING_ACR) {
-        az deployment group create --resource-group $script:RESOURCE_GROUP --template-file "infrastructure/main.bicep" --parameters "containerAppName=$($script:ContainerAppName)" "cosmosEndpoint=$($script:COSMOS_ENDPOINT)" "azureAiServiceEndpoint=$($script:OPENAI_ENDPOINT)" "embeddingDeploymentName=$($script:EMBEDDING_DEPLOYMENT)" "cosmosSemanticRerankerInferenceEndpoint=$($script:COSMOS_SEMANTIC_RERANKER_INFERENCE_ENDPOINT)" "useExistingAcr=true" "existingAcrName=$($script:ACR_NAME)" "existingAcrResourceGroup=$($script:ACR_RESOURCE_GROUP)" --output table
+        $deploymentOutput = (& az deployment group create --resource-group $script:RESOURCE_GROUP --template-file "infrastructure/main.bicep" --parameters "location=$($script:LOCATION)" "containerAppName=$($script:ContainerAppName)" "cosmosEndpoint=$($script:COSMOS_ENDPOINT)" "azureAiServiceEndpoint=$($script:OPENAI_ENDPOINT)" "embeddingDeploymentName=$($script:EMBEDDING_DEPLOYMENT)" "cosmosSemanticRerankerInferenceEndpoint=$($script:COSMOS_SEMANTIC_RERANKER_INFERENCE_ENDPOINT)" "useExistingAcr=true" "existingAcrName=$($script:ACR_NAME)" "existingAcrResourceGroup=$($script:ACR_RESOURCE_GROUP)" --output json 2>&1 | Out-String)
     }
     else {
-        az deployment group create --resource-group $script:RESOURCE_GROUP --template-file "infrastructure/main.bicep" --parameters "containerAppName=$($script:ContainerAppName)" "containerRegistryName=$($script:ACR_NAME)" "cosmosEndpoint=$($script:COSMOS_ENDPOINT)" "azureAiServiceEndpoint=$($script:OPENAI_ENDPOINT)" "embeddingDeploymentName=$($script:EMBEDDING_DEPLOYMENT)" "cosmosSemanticRerankerInferenceEndpoint=$($script:COSMOS_SEMANTIC_RERANKER_INFERENCE_ENDPOINT)" --output table
+        $deploymentOutput = (& az deployment group create --resource-group $script:RESOURCE_GROUP --template-file "infrastructure/main.bicep" --parameters "location=$($script:LOCATION)" "containerAppName=$($script:ContainerAppName)" "containerRegistryName=$($script:ACR_NAME)" "cosmosEndpoint=$($script:COSMOS_ENDPOINT)" "azureAiServiceEndpoint=$($script:OPENAI_ENDPOINT)" "embeddingDeploymentName=$($script:EMBEDDING_DEPLOYMENT)" "cosmosSemanticRerankerInferenceEndpoint=$($script:COSMOS_SEMANTIC_RERANKER_INFERENCE_ENDPOINT)" --output json 2>&1 | Out-String)
     }
 
     $deploymentExitCode = $LASTEXITCODE
+    $script:LAST_INFRASTRUCTURE_ERROR = $deploymentOutput
+    if (-not [string]::IsNullOrWhiteSpace($deploymentOutput)) {
+        Write-Host $deploymentOutput.Trim()
+    }
     if ($deploymentExitCode -ne 0) {
+        if (Test-Region-Recovery-Failure) {
+            throw "Azure Container Apps deployment failed because the selected region does not currently have sufficient capacity."
+        }
+
         $deployedApp = az containerapp show --name $ContainerAppName --resource-group $ResourceGroup 2>$null | ConvertFrom-Json
         if (-not $deployedApp) {
             throw "Azure Container resources deployment failed with exit code $deploymentExitCode and no Container App was created."
@@ -1735,7 +1943,7 @@ function Main {
     Auto-Detect-Resources
     Create-Entra-App
     Assign-Current-User-Role
-    Deploy-Infrastructure
+    Deploy-Infrastructure-With-Region-Recovery
     Get-Deployment-Outputs
     Assign-ACR-RBAC
     Update-Frontend-Config  # Must run BEFORE Build-And-Push-Image so HTML is updated before build

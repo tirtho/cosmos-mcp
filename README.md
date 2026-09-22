@@ -43,31 +43,9 @@ Cosmos DB and the embedding service are existing dependencies selected from the 
 - PowerShell 7+
 - .NET 9 SDK is optional for deployment; it is required only for local builds and tests
 
-## Build Locally
-
-Restore, build, and test the solution:
-
-```powershell
-dotnet restore .\AzureCosmosDB.MCP.Toolkit.sln
-dotnet build .\AzureCosmosDB.MCP.Toolkit.sln --configuration Release
-dotnet test .\tests\AzureCosmosDB.MCP.Toolkit.Tests\AzureCosmosDB.MCP.Toolkit.Tests.csproj --configuration Release --no-restore
-```
-
-Run the server locally with the .NET SDK:
-
-```powershell
-dotnet run --project .\src\AzureCosmosDB.MCP.Toolkit\AzureCosmosDB.MCP.Toolkit.csproj
-```
-
-For the local Docker Compose setup:
-
-```powershell
-docker compose up --build
-```
-
 ## Deploy To Azure
 
-The supported deployment path is the PowerShell script. It derives the resource group and service names from the environment and suffix:
+The supported deployment path uses two PowerShell scripts after the resource group has been prepared. The scripts derive the resource group and service names from the environment and suffix:
 
 ```text
 Resource group: rg-eia-<environment>-<suffix>
@@ -90,30 +68,55 @@ az group create --name "rg-eia-dev-1" --location "eastus2"
 .\scripts\Deploy-Cosmos-MCP-Toolkit.ps1 -Environment dev -Suffix 1 -Location eastus2
 ```
 
-The script uses Azure Container Registry Tasks to build the image remotely from `Dockerfile`, pushes it to ACR, deploys the Bicep infrastructure, configures Entra authentication, assigns managed-identity permissions, updates the Container App, and runs authenticated health and Cosmos DB smoke tests. Docker Desktop is not required for deployment.
+The deployment script automatically discovers or prompts you to select the Cosmos DB account, Foundry project, and embedding deployment. It then creates the Entra application, deploys the infrastructure, builds and pushes the image with Azure Container Registry Tasks, assigns the required permissions, updates the Container App, writes `scripts\deployment-info.json`, and runs authenticated health and Cosmos DB smoke tests. Docker Desktop is not required for deployment.
 
-3. Open the deployed application:
+If Azure Container Apps or ACR reports a regional capacity or availability error, the script removes only resources created by the failed deployment, shows the three nearest eligible regions, and prompts you to select one or enter another region. Existing Cosmos DB, Foundry, ACR, Container App, and Entra resources are preserved.
 
-```powershell
-$fqdn = az containerapp show --name "ca-eia-dev-1" --resource-group "rg-eia-dev-1" --query properties.configuration.ingress.fqdn -o tsv
-Start-Process "https://$fqdn"
-```
-
-Check health directly:
-
-```powershell
-curl "https://$fqdn/health"
-```
-
-Deployment output is written to `scripts\deployment-info.json`. The script also assigns the signed-in user the `Mcp.Tool.Executor` role. If role assignment fails, assign the role in Microsoft Entra Enterprise Applications and rerun the deployment.
-
-To create the Foundry project managed-identity connection after deployment, run the setup script while signed in to the Azure CLI. It derives the resource group as `rg-eia-<environment>-<suffix>`, reads the active subscription, lists the Foundry projects in that resource group, and prompts you to select one:
+3. Create the Foundry connection and configure agents by running the setup script while signed in to the Azure CLI:
 
 ```powershell
 .\scripts\Setup-AIFoundry-Connection.ps1 -Environment dev -Suffix 1
 ```
 
-The script creates the `ProjectManagedIdentity` connection for the selected project, uses the deployed MCP URL from `deployment-info.json`, assigns the `Mcp.Tool.Executor` app role to the Foundry project managed identity, and configures the MCP audience as `api://<ENTRA_APP_CLIENT_ID>`. It then lists the agents in that project so you can select one or more. For each selected agent, it displays the existing instructions and lets you keep them, use the Cosmos DB example, enter a replacement, or load instructions from a UTF-8 text file. It attaches the MCP tool with approval required and an allow-list of the server's tools.
+The setup script reads `scripts\deployment-info.json`, prompts you to select the Foundry project and agents, creates or updates the `ProjectManagedIdentity` connection, assigns the `Mcp.Tool.Executor` app role to the Foundry project managed identity and selected agent identities, and attaches the MCP tool with approval required. For each selected agent, it lets you keep the existing instructions, use the Cosmos DB example, enter a replacement, or load instructions from a UTF-8 text file.
+
+Agent configuration is idempotent. Re-running the script updates the existing connection and role assignment, and creates a new agent version only when the selected agent's instructions or Cosmos DB MCP tool configuration has changed. Existing non-MCP tools and other agent definition settings are preserved.
+
+## Build Locally (optional)
+
+Restore, build, and test the solution:
+
+```powershell
+dotnet restore .\AzureCosmosDB.MCP.Toolkit.sln
+dotnet build .\AzureCosmosDB.MCP.Toolkit.sln --configuration Release
+dotnet test .\tests\AzureCosmosDB.MCP.Toolkit.Tests\AzureCosmosDB.MCP.Toolkit.Tests.csproj --configuration Release --no-restore
+```
+
+Run the server locally with the .NET SDK:
+
+```powershell
+dotnet run --project .\src\AzureCosmosDB.MCP.Toolkit\AzureCosmosDB.MCP.Toolkit.csproj
+```
+
+For the local Docker Compose setup:
+
+```powershell
+docker compose up --build
+```
+
+## Troubleshooting
+
+The deployment script also assigns the signed-in user the `Mcp.Tool.Executor` role. If that assignment fails, assign the role in Microsoft Entra Enterprise Applications and rerun the deployment.
+
+The separate `Assign-Role-To-*.ps1` and `Verify-Role-Assignments.ps1` scripts are administrative troubleshooting tools and are not required for a standard deployment.
+
+To verify the deployed application manually:
+
+```powershell
+$fqdn = az containerapp show --name "ca-eia-dev-1" --resource-group "rg-eia-dev-1" --query properties.configuration.ingress.fqdn -o tsv
+Start-Process "https://$fqdn"
+curl "https://$fqdn/health"
+```
 
 To apply the same multiline instructions to selected agents without an interactive instruction prompt:
 
@@ -121,7 +124,7 @@ To apply the same multiline instructions to selected agents without an interacti
 .\scripts\Setup-AIFoundry-Connection.ps1 -Environment dev -Suffix 1 -AgentInstructionsFile .\scripts\cosmos-agent-instructions.example.txt
 ```
 
-To test a configured agent from the same script, add `-TestAgent`. The script prompts for the agent number and the prompt to send:
+To test a configured agent from the same script, add `-TestAgent`. The script prompts for the agent number and the prompt to send. This is optional:
 
 ```powershell
 .\scripts\Setup-AIFoundry-Connection.ps1 -Environment dev -Suffix 1 -TestAgent
@@ -132,8 +135,6 @@ You can provide the prompt non-interactively with `-TestPrompt`:
 ```powershell
 .\scripts\Setup-AIFoundry-Connection.ps1 -Environment dev -Suffix 1 -TestAgent -TestPrompt "List the databases available to you."
 ```
-
-Agent configuration is idempotent. Re-running the script updates the existing connection and role assignment, and creates a new agent version only when the selected agent's instructions or Cosmos DB MCP tool configuration has changed. Existing non-MCP tools and other agent definition settings are preserved.
 
 ## Infrastructure Files
 
