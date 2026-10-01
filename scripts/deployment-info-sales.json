@@ -1,0 +1,21 @@
+﻿{
+    "ACR_RESOURCE_GROUP":  "rg-eia-ins-1",
+    "ENTRA_APP_SP_OBJECT_ID":  "698d2618-e687-4063-bdde-3a1028ba6f8a",
+    "SUBSCRIPTION_ID":  "752072ff-0fc4-4f53-b852-f82991bfa110",
+    "ENTRA_APP_DISPLAY_NAME":  "entra-eia-ins-1-sales",
+    "ENTRA_APP_OBJECT_ID":  "04e2a431-92e1-4c1c-8e25-4cd1345fa3fd",
+    "MCP_SERVER_URI":  "https://ca-eia-ins-1-sales.blackglacier-52c5ac2d.southcentralus.azurecontainerapps.io",
+    "ENTRA_APP_CLIENT_ID":  "d76e72ca-c5e3-4e19-95fb-335f39e56a8f",
+    "CONTAINER_APP_NAME":  "ca-eia-ins-1-sales",
+    "COSMOS_ACCOUNT_NAME":  "cosmos-eia-ins-1-sales",
+    "TENANT_ID":  "da65575b-31d6-4e6a-a9ca-1a7af066d7fe",
+    "ENTRA_APP_ROLE_VALUE":  "Mcp.Tool.Executor",
+    "RESOURCE_GROUP":  "rg-eia-ins-1",
+    "LOCATION":  "southcentralus",
+    "ACR_NAME":  "acrins1",
+    "SERVER_NAME":  "sales",
+    "ACA_MI_PRINCIPAL_ID":  "fec3ce16-a57e-4af3-b2f6-efefaa733119",
+    "ENTRA_APP_ROLE_ID_BY_VALUE":  "2dd747ec-31b6-4747-9c48-38e996c649d7",
+    "COSMOS_RESOURCE_GROUP":  "rg-eia-ins-1",
+    "ACA_MI_DISPLAY_NAME":  "ca-eia-ins-1-sales"
+}

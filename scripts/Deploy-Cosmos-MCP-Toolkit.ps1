@@ -14,8 +14,12 @@
     Environment name used to construct the resource group (for example, dev)
 .PARAMETER Suffix
     Numeric or short suffix used to construct the resource group (for example, 1)
+.PARAMETER ServerName
+    Optional server identifier (for example, sales). Shares the environment and registry with other servers in the same resource group.
 .PARAMETER Location
     Optional Azure region override. When omitted, the resource group's region is used.
+.PARAMETER ContainerAppsEnvironmentName
+    Optional shared environment name override when deploying into another region.
 .EXAMPLE
     ./Deploy-Cosmos-MCP-Toolkit.ps1 -Environment dev -Suffix 1
 .EXAMPLE
@@ -30,9 +34,17 @@ param(
     [Parameter(Mandatory=$true)]
     [ValidatePattern('^[a-zA-Z0-9-]+$')]
     [string]$Suffix,
+
+    [Parameter(Mandatory=$false)]
+    [ValidatePattern('^[a-zA-Z0-9]+(-[a-zA-Z0-9]+)*$')]
+    [string]$ServerName = "",
     
     [Parameter(Mandatory=$false)]
-    [string]$Location = ""
+    [string]$Location = "",
+
+    [Parameter(Mandatory=$false)]
+    [ValidatePattern('^[a-zA-Z][a-zA-Z0-9-]*[a-zA-Z0-9]$')]
+    [string]$ContainerAppsEnvironmentName = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -53,7 +65,8 @@ function Select-Resource {
         [Parameter(Mandatory=$true)]
         [object[]]$Resources,
         [Parameter(Mandatory=$true)]
-        [string]$Label
+        [string]$Label,
+        [string]$PreferredName = ""
     )
 
     if (-not $Resources -or $Resources.Count -eq 0) {
@@ -67,14 +80,25 @@ function Select-Resource {
         return $Resources[0]
     }
 
+    $preferredIndex = -1
     Write-Host "Select a $($Label):"
     for ($index = 0; $index -lt $Resources.Count; $index++) {
         $resourceLabel = if ($Resources[$index].displayName) { $Resources[$index].displayName } else { $Resources[$index].name }
-        Write-Host "  [$($index + 1)] $resourceLabel"
+        if ($PreferredName -and $Resources[$index].name -eq $PreferredName) {
+            $preferredIndex = $index
+            Write-Host "  [$($index + 1)] $resourceLabel (default)"
+        }
+        else {
+            Write-Host "  [$($index + 1)] $resourceLabel"
+        }
     }
 
     do {
-        $selection = Read-Host "Enter selection (1-$($Resources.Count))"
+        $prompt = if ($preferredIndex -ge 0) { "Enter selection (1-$($Resources.Count), Enter for $($preferredIndex + 1))" } else { "Enter selection (1-$($Resources.Count))" }
+        $selection = Read-Host $prompt
+        if ([string]::IsNullOrWhiteSpace($selection) -and $preferredIndex -ge 0) {
+            return $Resources[$preferredIndex]
+        }
         $selectionNumber = 0
     } until ([int]::TryParse($selection, [ref]$selectionNumber) -and $selectionNumber -ge 1 -and $selectionNumber -le $Resources.Count)
 
@@ -82,14 +106,16 @@ function Select-Resource {
 }
 
 function Select-Cosmos-Account {
-    $cosmosAccounts = @(az cosmosdb list --resource-group $script:RESOURCE_GROUP --query "[].{name:name,id:id,location:location,documentEndpoint:documentEndpoint}" -o json | ConvertFrom-Json)
+    $cosmosAccountsJson = az cosmosdb list --resource-group $script:RESOURCE_GROUP --query "[].{name:name,id:id,location:location,documentEndpoint:documentEndpoint}" -o json
+    $cosmosAccounts = @(ConvertFrom-Json -InputObject ($cosmosAccountsJson -join "`n") | ForEach-Object { $_ })
     if (-not $cosmosAccounts -or $cosmosAccounts.Count -eq 0) {
         Write-Error "No Azure Cosmos DB accounts were found in '$($script:RESOURCE_GROUP)' for subscription '$($script:SUBSCRIPTION_NAME)' ($($script:SUBSCRIPTION_ID))."
         Write-Error "Create or move a Cosmos DB account into this resource group, then run the deployment again."
         exit 1
     }
 
-    $selectedAccount = Select-Resource -Resources $cosmosAccounts -Label "Azure Cosmos DB account"
+    $preferredCosmosName = if ($script:SERVER_NAME) { "cosmos-eia-$($script:ENVIRONMENT)-$($script:SUFFIX)-$($script:SERVER_NAME)" } else { "" }
+    $selectedAccount = Select-Resource -Resources $cosmosAccounts -Label "Azure Cosmos DB account" -PreferredName $preferredCosmosName
     $script:CosmosAccountName = $selectedAccount.name
     $script:COSMOS_ENDPOINT = $selectedAccount.documentEndpoint
     $cosmosRegionSlug = ($selectedAccount.location -replace '\s', '').ToLowerInvariant()
@@ -102,8 +128,10 @@ function Select-Foundry-Project {
     # Foundry projects can be represented as either legacy ML workspaces or
     # current Cognitive Services account project child resources. Neither query
     # applies a location filter; resources may be in any Azure region.
-    $legacyProjects = @(az resource list --resource-group $script:RESOURCE_GROUP --resource-type Microsoft.MachineLearningServices/workspaces --query "[?kind=='Project' || kind=='project'].{name:name,id:id,kind:kind}" -o json | ConvertFrom-Json)
-    $cognitiveServiceProjects = @(az resource list --resource-group $script:RESOURCE_GROUP --resource-type Microsoft.CognitiveServices/accounts/projects --query "[?kind=='AIServices' || kind=='aiservices' || kind=='Project' || kind=='project'].{name:name,id:id,kind:kind}" -o json | ConvertFrom-Json)
+    $legacyProjectsJson = az resource list --resource-group $script:RESOURCE_GROUP --resource-type Microsoft.MachineLearningServices/workspaces --query "[?kind=='Project' || kind=='project'].{name:name,id:id,kind:kind}" -o json
+    $legacyProjects = @(ConvertFrom-Json -InputObject ($legacyProjectsJson -join "`n") | ForEach-Object { $_ })
+    $cognitiveServiceProjectsJson = az resource list --resource-group $script:RESOURCE_GROUP --resource-type Microsoft.CognitiveServices/accounts/projects --query "[?kind=='AIServices' || kind=='aiservices' || kind=='Project' || kind=='project'].{name:name,id:id,kind:kind}" -o json
+    $cognitiveServiceProjects = @(ConvertFrom-Json -InputObject ($cognitiveServiceProjectsJson -join "`n") | ForEach-Object { $_ })
     $projects = @($legacyProjects + $cognitiveServiceProjects)
     if (-not $projects -or $projects.Count -eq 0) {
         Write-Error "No Microsoft Foundry projects were found in '$($script:RESOURCE_GROUP)' for subscription '$($script:SUBSCRIPTION_NAME)' ($($script:SUBSCRIPTION_ID))."
@@ -134,10 +162,12 @@ function Select-Foundry-Project {
 }
 
 function Select-Embedding-Deployment {
-    $cognitiveAccounts = @(az cognitiveservices account list --resource-group $script:RESOURCE_GROUP --query "[].{name:name,id:id,kind:kind,endpoint:properties.endpoint}" -o json | ConvertFrom-Json)
+    $cognitiveAccountsJson = az cognitiveservices account list --resource-group $script:RESOURCE_GROUP --query "[].{name:name,id:id,kind:kind,endpoint:properties.endpoint}" -o json
+    $cognitiveAccounts = @(ConvertFrom-Json -InputObject ($cognitiveAccountsJson -join "`n") | ForEach-Object { $_ })
     $deployments = @()
     foreach ($account in $cognitiveAccounts) {
-        $accountDeployments = @(az cognitiveservices account deployment list --name $account.name --resource-group $script:RESOURCE_GROUP -o json 2>$null | ConvertFrom-Json)
+        $accountDeploymentsJson = az cognitiveservices account deployment list --name $account.name --resource-group $script:RESOURCE_GROUP -o json 2>$null
+        $accountDeployments = @(ConvertFrom-Json -InputObject ($accountDeploymentsJson -join "`n") | ForEach-Object { $_ })
         foreach ($deployment in $accountDeployments) {
             if ($deployment.name -match 'embedding|ada|text-embedding') {
                 $deployments += [pscustomobject]@{
@@ -206,8 +236,8 @@ function Select-Embedding-Deployment {
         Write-Info "Selected embedding deployment: $($selectedDeployment.name) ($($selectedDeployment.modelName) $($selectedDeployment.modelVersion))"
     }
 
-    $confirmation = Read-Host "Confirm this is the same embedding model used to vectorize the selected Cosmos DB data? (y/n)"
-    if ($confirmation -notmatch '^(y|yes)$') {
+    $confirmation = Read-Host "Confirm this is the same embedding model used to vectorize the selected Cosmos DB data? (Y/n)"
+    if ($confirmation -notmatch '^(|y|yes)$') {
         Write-Error "Embedding model confirmation was not provided. Deployment cancelled to avoid incompatible vector dimensions."
         exit 1
     }
@@ -222,13 +252,15 @@ function Auto-Detect-Resources {
 }
 
 function Show-Usage {
-    Write-Host "Usage: $($MyInvocation.MyCommand.Name) -Environment <environment> -Suffix <suffix> [-Location <location>]"
+    Write-Host "Usage: $($MyInvocation.MyCommand.Name) -Environment <environment> -Suffix <suffix> [-ServerName <name>] [-Location <location>] [-ContainerAppsEnvironmentName <name>]"
     Write-Host ""
     Write-Host "Arguments:"
     Write-Host "  -Environment             Environment used in resource group name rg-eia-<environment>-<suffix>"
     Write-Host "  -Suffix                  Suffix used in resource group name"
+    Write-Host "  -ServerName              Optional name for a distinct MCP server in the shared environment"
     Write-Host "  -Location               Optional region override (defaults to the resource group's region)"
-    Write-Host "  Names are derived as acr<environment><suffix>, ca-eia-<environment>-<suffix>, and entra-eia-<environment>-<suffix>"
+    Write-Host "  -ContainerAppsEnvironmentName  Optional shared environment name override for a different region"
+    Write-Host "  Names are derived as acr<environment><suffix>, caenv-eia-<environment>-<suffix>, ca-eia-<environment>-<suffix>[-<name>], and entra-eia-<environment>-<suffix>[-<name>]"
     Write-Host ""
     exit 1
 }
@@ -237,17 +269,23 @@ function Parse-Arguments {
     # Set script-level variables for use in all functions
     $script:ENVIRONMENT = $Environment.ToLowerInvariant()
     $script:SUFFIX = $Suffix.ToLowerInvariant()
+    $script:SERVER_NAME = $ServerName.ToLowerInvariant()
     $script:RESOURCE_GROUP = "rg-eia-$($script:ENVIRONMENT)-$($script:SUFFIX)"
+    $script:CONTAINER_APP_ENVIRONMENT_NAME = if ($ContainerAppsEnvironmentName) { $ContainerAppsEnvironmentName.ToLowerInvariant() } else { "caenv-eia-$($script:ENVIRONMENT)-$($script:SUFFIX)" }
     $script:ResourceGroup = $script:RESOURCE_GROUP
     $script:LOCATION = $Location
-    $script:ENTRA_APP_NAME = "entra-eia-$($script:ENVIRONMENT)-$($script:SUFFIX)"
+    $serverPart = if ($script:SERVER_NAME) { "-$($script:SERVER_NAME)" } else { "" }
+    $script:ENTRA_APP_NAME = "entra-eia-$($script:ENVIRONMENT)-$($script:SUFFIX)$serverPart"
     # ACR names are globally unique and allow only lowercase letters and numbers.
     $acrNameSuffix = "$($script:ENVIRONMENT)$($script:SUFFIX)" -replace '[^a-z0-9]', ''
     $script:ACR_NAME = "acr$acrNameSuffix"
     if ($script:ACR_NAME.Length -gt 50) {
         $script:ACR_NAME = $script:ACR_NAME.Substring(0, 50)
     }
-    $script:ContainerAppName = "ca-eia-$($script:ENVIRONMENT)-$($script:SUFFIX)"
+    $script:ContainerAppName = "ca-eia-$($script:ENVIRONMENT)-$($script:SUFFIX)$serverPart"
+    if ($script:ContainerAppName.Length -gt 32) {
+        throw "Container App name '$($script:ContainerAppName)' exceeds the 32-character limit. Shorten -ServerName, -Environment or -Suffix."
+    }
     $script:COSMOS_RESOURCE_GROUP = $script:RESOURCE_GROUP
     $script:ACR_RESOURCE_GROUP = $script:RESOURCE_GROUP
     $script:USE_EXISTING_ACR = $false
@@ -262,6 +300,7 @@ function Parse-Arguments {
     Write-Info "Using Cosmos Resource Group: $($script:COSMOS_RESOURCE_GROUP)"
     Write-Info "Using ACR Resource Group: $($script:ACR_RESOURCE_GROUP)"
     Write-Info "Using derived ACR Name: $($script:ACR_NAME)"
+    Write-Info "Using Container Apps Environment Name: $($script:CONTAINER_APP_ENVIRONMENT_NAME)"
     Write-Info "Using Container App Name: $($script:ContainerAppName)"
     Write-Info "Using Entra App Name: $($script:ENTRA_APP_NAME)"
 }
@@ -887,6 +926,26 @@ function Verify-Resource-Group {
         Write-Warn "Using explicit location override '$($script:LOCATION)' instead of resource group region '$($resourceGroupDetails.location)'."
     }
 
+    $environmentsJson = az containerapp env list --resource-group $script:RESOURCE_GROUP -o json
+    if ($LASTEXITCODE -ne 0) { throw "Could not list Container Apps environments in '$($script:RESOURCE_GROUP)'." }
+    $environments = @(ConvertFrom-Json -InputObject ($environmentsJson -join "`n") | ForEach-Object { $_ })
+    $existingEnvironment = $environments | Where-Object { $_.name -eq $script:CONTAINER_APP_ENVIRONMENT_NAME } | Select-Object -First 1
+    if ($existingEnvironment) {
+        if (($existingEnvironment.location -replace '\s', '') -ne ($script:LOCATION -replace '\s', '')) {
+            throw "Container Apps environment '$($script:CONTAINER_APP_ENVIRONMENT_NAME)' is in '$($existingEnvironment.location)', not '$($script:LOCATION)'. Choose a different -ContainerAppsEnvironmentName for this region."
+        }
+        if ($existingEnvironment.properties.provisioningState -ne 'Succeeded') {
+            throw "Container Apps environment '$($script:CONTAINER_APP_ENVIRONMENT_NAME)' is in state '$($existingEnvironment.properties.provisioningState)'. Choose a healthy environment or a different -ContainerAppsEnvironmentName."
+        }
+        Write-Info "Using existing Container Apps environment: $($script:CONTAINER_APP_ENVIRONMENT_NAME)"
+    }
+
+    $registriesJson = az acr list --resource-group $script:ACR_RESOURCE_GROUP --query "[?name=='$($script:ACR_NAME)'].name" -o json
+    if ($LASTEXITCODE -ne 0) { throw "Could not list container registries in '$($script:ACR_RESOURCE_GROUP)'." }
+    $registries = @(ConvertFrom-Json -InputObject ($registriesJson -join "`n") | ForEach-Object { $_ })
+    $script:USE_EXISTING_ACR = $registries.Count -gt 0
+    if ($script:USE_EXISTING_ACR) { Write-Info "Using existing container registry: $($script:ACR_NAME)" }
+
     if ($script:COSMOS_RESOURCE_GROUP -ne $script:RESOURCE_GROUP) {
         Write-Info "Verifying Cosmos resource group exists: $($script:COSMOS_RESOURCE_GROUP)"
         $cosmosRgExists = az group exists --name $script:COSMOS_RESOURCE_GROUP
@@ -898,25 +957,50 @@ function Verify-Resource-Group {
 
 }
 
+function Test-ReadyContainerApp {
+    $appsJson = az containerapp list --resource-group $script:RESOURCE_GROUP --query "[?name=='$($script:ContainerAppName)']" -o json
+    if ($LASTEXITCODE -ne 0) { throw "Could not inspect Container App '$($script:ContainerAppName)'." }
+    $apps = @(ConvertFrom-Json -InputObject ($appsJson -join "`n") | ForEach-Object { $_ })
+    if ($apps.Count -eq 0) { return $false }
+
+    $app = $apps[0]
+    $expectedEnvironmentId = "/subscriptions/$($script:SUBSCRIPTION_ID)/resourceGroups/$($script:RESOURCE_GROUP)/providers/Microsoft.App/managedEnvironments/$($script:CONTAINER_APP_ENVIRONMENT_NAME)"
+    if ($app.properties.managedEnvironmentId -ne $expectedEnvironmentId -or
+        $app.properties.template.containers[0].env.Where({ $_.name -eq 'COSMOS_ENDPOINT' }).value -ne $script:COSMOS_ENDPOINT) {
+        throw "Existing Container App '$($script:ContainerAppName)' does not match the selected environment or Cosmos account."
+    }
+
+    $revisionsJson = az containerapp revision list --name $script:ContainerAppName --resource-group $script:RESOURCE_GROUP -o json
+    if ($LASTEXITCODE -ne 0) { return $false }
+    $revisions = @(ConvertFrom-Json -InputObject ($revisionsJson -join "`n") | ForEach-Object { $_ })
+    return @($revisions | Where-Object { $_.properties.active -and $_.properties.healthState -eq 'Healthy' }).Count -gt 0
+}
+
 function Deploy-Infrastructure {
     Write-Info "Applying Azure Container resources..."
     Write-Info "Existing resources will be reconciled with the Bicep template."
 
+    if (Test-ReadyContainerApp) {
+        Write-Info "Container App '$($script:ContainerAppName)' has a healthy revision; continuing with permissions and image deployment."
+        return
+    }
+
+    $deploymentParameters = @("environmentName=$($script:CONTAINER_APP_ENVIRONMENT_NAME)", "location=$($script:LOCATION)")
+    if ($script:SERVER_NAME) { $deploymentParameters += "maxReplicas=1" }
     if ($script:USE_EXISTING_ACR) {
-        az deployment group create --resource-group $script:RESOURCE_GROUP --template-file "infrastructure/main.bicep" --parameters "containerAppName=$($script:ContainerAppName)" "cosmosEndpoint=$($script:COSMOS_ENDPOINT)" "azureAiServiceEndpoint=$($script:OPENAI_ENDPOINT)" "embeddingDeploymentName=$($script:EMBEDDING_DEPLOYMENT)" "cosmosSemanticRerankerInferenceEndpoint=$($script:COSMOS_SEMANTIC_RERANKER_INFERENCE_ENDPOINT)" "useExistingAcr=true" "existingAcrName=$($script:ACR_NAME)" "existingAcrResourceGroup=$($script:ACR_RESOURCE_GROUP)" --output table
+        az deployment group create --resource-group $script:RESOURCE_GROUP --template-file "infrastructure/main.bicep" --parameters "containerAppName=$($script:ContainerAppName)" "cosmosEndpoint=$($script:COSMOS_ENDPOINT)" "azureAiServiceEndpoint=$($script:OPENAI_ENDPOINT)" "embeddingDeploymentName=$($script:EMBEDDING_DEPLOYMENT)" "cosmosSemanticRerankerInferenceEndpoint=$($script:COSMOS_SEMANTIC_RERANKER_INFERENCE_ENDPOINT)" "useExistingAcr=true" "existingAcrName=$($script:ACR_NAME)" "existingAcrResourceGroup=$($script:ACR_RESOURCE_GROUP)" $deploymentParameters --output table
     }
     else {
-        az deployment group create --resource-group $script:RESOURCE_GROUP --template-file "infrastructure/main.bicep" --parameters "containerAppName=$($script:ContainerAppName)" "containerRegistryName=$($script:ACR_NAME)" "cosmosEndpoint=$($script:COSMOS_ENDPOINT)" "azureAiServiceEndpoint=$($script:OPENAI_ENDPOINT)" "embeddingDeploymentName=$($script:EMBEDDING_DEPLOYMENT)" "cosmosSemanticRerankerInferenceEndpoint=$($script:COSMOS_SEMANTIC_RERANKER_INFERENCE_ENDPOINT)" --output table
+        az deployment group create --resource-group $script:RESOURCE_GROUP --template-file "infrastructure/main.bicep" --parameters "containerAppName=$($script:ContainerAppName)" "containerRegistryName=$($script:ACR_NAME)" "cosmosEndpoint=$($script:COSMOS_ENDPOINT)" "azureAiServiceEndpoint=$($script:OPENAI_ENDPOINT)" "embeddingDeploymentName=$($script:EMBEDDING_DEPLOYMENT)" "cosmosSemanticRerankerInferenceEndpoint=$($script:COSMOS_SEMANTIC_RERANKER_INFERENCE_ENDPOINT)" $deploymentParameters --output table
     }
 
     $deploymentExitCode = $LASTEXITCODE
     if ($deploymentExitCode -ne 0) {
-        $deployedApp = az containerapp show --name $ContainerAppName --resource-group $ResourceGroup 2>$null | ConvertFrom-Json
-        if (-not $deployedApp) {
-            throw "Azure Container resources deployment failed with exit code $deploymentExitCode and no Container App was created."
+        if (Test-ReadyContainerApp) {
+            Write-Warn "ARM deployment reported a failure, but the Container App revision is healthy. Continuing with permissions and image deployment."
+            return
         }
-
-        Write-Warn "Infrastructure deployment returned exit code $deploymentExitCode, but the Container App exists. Continuing so permissions and the application image can be applied."
+        throw "Azure Container resources deployment failed with exit code $deploymentExitCode. Review the Azure deployment error above before retrying."
     }
 
     Write-Info "Azure Container resources deployment completed!"
@@ -1122,7 +1206,7 @@ function Update-Container-App {
         }
     }
     
-    # ACR access is configured in Bicep with the Container App system identity.
+    # ACR access is configured after the app identity receives AcrPull.
     Write-Info "Verifying ACR managed-identity registry configuration..."
     $acrName = $script:ACR_NAME
     if ([string]::IsNullOrWhiteSpace($acrName)) {
@@ -1273,6 +1357,11 @@ function Assign-ACR-RBAC {
     }
     else {
         Write-Info "AcrPull assignment already exists for Container App MI."
+    }
+
+    az containerapp registry set --name $script:ContainerAppName --resource-group $script:RESOURCE_GROUP --server "$($script:ACR_NAME).azurecr.io" --identity system --output none
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to configure ACR for the Container App after assigning AcrPull."
     }
 }
 
@@ -1639,13 +1728,16 @@ function Show-Deployment-Summary {
         SUBSCRIPTION_ID = (az account show --query id -o tsv)
         TENANT_ID = (az account show --query tenantId -o tsv)
         COSMOS_ACCOUNT_NAME = $script:CosmosAccountName
+        SERVER_NAME = $script:SERVER_NAME
+        CONTAINER_APP_NAME = $script:ContainerAppName
         LOCATION = $script:LOCATION
     }
     
     $SUMMARY_JSON = $SUMMARY | ConvertTo-Json
     Write-Host $SUMMARY_JSON
     
-    $DEPLOYMENT_INFO_FILE = "$SCRIPT_DIR/deployment-info.json"
+    $infoFileName = if ($script:SERVER_NAME) { "deployment-info-$($script:SERVER_NAME).json" } else { "deployment-info.json" }
+    $DEPLOYMENT_INFO_FILE = Join-Path $SCRIPT_DIR $infoFileName
     $SUMMARY_JSON | Out-File -FilePath $DEPLOYMENT_INFO_FILE -Encoding UTF8
     Write-Info "Deployment information written to: $DEPLOYMENT_INFO_FILE"
 }

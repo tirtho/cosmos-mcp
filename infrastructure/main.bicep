@@ -99,7 +99,7 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
       activeRevisionsMode: 'Single'
       ingress: {
         external: true
-        targetPort: 8080
+        targetPort: 80
         allowInsecure: false
         transport: 'http'
         traffic: [
@@ -109,12 +109,6 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
           }
         ]
       }
-      registries: [
-        {
-          server: useExistingAcr ? existingContainerRegistry!.properties.loginServer : containerRegistry!.properties.loginServer
-          identity: 'system'
-        }
-      ]
     }
     template: {
       containers: [
@@ -160,34 +154,6 @@ resource containerApp 'Microsoft.App/containerApps@2024-03-01' = {
             }
             // NOTE: AzureAd__ClientId and AzureAd__Audience will be set by deployment script
             // after the Entra app is created
-          ]
-          probes: [
-            {
-              type: 'Readiness'
-              httpGet: {
-                path: '/health'
-                port: 8080
-                scheme: 'HTTP'
-              }
-              initialDelaySeconds: 10
-              periodSeconds: 10
-              timeoutSeconds: 5
-              successThreshold: 1
-              failureThreshold: 3
-            }
-            {
-              type: 'Liveness'
-              httpGet: {
-                path: '/health'
-                port: 8080
-                scheme: 'HTTP'
-              }
-              initialDelaySeconds: 30
-              periodSeconds: 30
-              timeoutSeconds: 5
-              successThreshold: 1
-              failureThreshold: 3
-            }
           ]
         }
       ]

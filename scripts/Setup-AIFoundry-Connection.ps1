@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     This script:
-    1. Reads deployment information from deployment-info.json
+    1. Reads deployment information from deployment-info.json or deployment-info-<server>.json
     2. Retrieves Microsoft Foundry project managed identity details
     3. Creates a managed identity connection in Microsoft Foundry for the Cosmos DB MCP Toolkit server
     4. Assigns the Entra App role to the Microsoft Foundry project managed identity
@@ -15,8 +15,11 @@
 .PARAMETER Suffix
     Numeric or short suffix used to construct the resource group (for example, 1)
 
+.PARAMETER ServerName
+    Optional server identifier used by the deployment script (for example, sales).
+
 .PARAMETER ConnectionName
-    Name for the connection in Microsoft Foundry (e.g., "cosmos-mcp-connection")
+    Name for the connection in Microsoft Foundry (defaults to a name based on ServerName).
 
 .PARAMETER AgentInstructionsFile
     Optional UTF-8 text file containing the instructions to apply to selected agents.
@@ -30,10 +33,13 @@
 .EXAMPLE
     .\Setup-AIFoundry-Connection.ps1 -Environment dev -Suffix 1
 
+.EXAMPLE
+    .\Setup-AIFoundry-Connection.ps1 -Environment dev -Suffix 1 -ServerName sales
+
 .NOTES
     Prerequisites:
     - Azure CLI installed and authenticated
-    - deployment-info.json must exist in the same directory (created by Deploy-Cosmos-MCP-Toolkit.ps1)
+    - The corresponding deployment-info JSON must exist in the same directory (created by Deploy-Cosmos-MCP-Toolkit.ps1)
     - Appropriate permissions to manage Microsoft Foundry projects and Entra ID app role assignments
 #>
 
@@ -45,9 +51,13 @@ param(
     [Parameter(Mandatory=$true)]
     [ValidatePattern('^[a-zA-Z0-9-]+$')]
     [string]$Suffix,
+
+    [Parameter(Mandatory=$false)]
+    [ValidatePattern('^[a-zA-Z0-9]+(-[a-zA-Z0-9]+)*$')]
+    [string]$ServerName = "",
     
     [Parameter(Mandatory=$false)]
-    [string]$ConnectionName = "cosmos-mcp-toolkit-connection",
+    [string]$ConnectionName = "",
 
     [Parameter(Mandatory=$false)]
     [string]$AgentInstructionsFile,
@@ -80,7 +90,7 @@ function Write-Error-Message {
 
 function Print-Usage {
     Write-Host @"
-Usage: .\Setup-AIFoundry-Connection.ps1 -Environment <environment> -Suffix <suffix> [OPTIONS]
+Usage: .\Setup-AIFoundry-Connection.ps1 -Environment <environment> -Suffix <suffix> [-ServerName <name>] [OPTIONS]
 
 Create a managed identity connection for a selected Microsoft Foundry project and assign the Entra app role.
 
@@ -88,6 +98,7 @@ REQUIRED PARAMETERS:
   -Environment <environment>
                           Environment used in the resource group name (for example, dev)
   -Suffix <suffix>        Suffix used in the resource group name (for example, 1)
+    -ServerName <name>      Optional named MCP server (for example, sales)
   -ConnectionName <name>
                           Connection name
     -AgentInstructionsFile <path>
@@ -95,7 +106,7 @@ REQUIRED PARAMETERS:
     -TestAgent              Prompt for an agent and test prompt after setup
     -TestPrompt <text>      Prompt to send with -TestAgent
 
-NOTE: deployment-info.json must exist in the same directory as this script.
+NOTE: deployment-info[-<server>].json must exist in the same directory as this script.
       This file is produced when running Deploy-Cosmos-MCP-Toolkit.ps1
       It should contain: MCP_SERVER_URI, ENTRA_APP_CLIENT_ID, ENTRA_APP_ROLE_VALUE, ENTRA_APP_ROLE_ID_BY_VALUE, ENTRA_APP_SP_OBJECT_ID
       Connection target is read from MCP_SERVER_URI.
@@ -107,6 +118,10 @@ EXAMPLES:
 }
 
 function Parse-Arguments {
+    $script:SERVER_NAME = $ServerName.ToLowerInvariant()
+    if (-not $ConnectionName) {
+        $script:ConnectionName = if ($script:SERVER_NAME) { "cosmos-mcp-$($script:SERVER_NAME)-connection" } else { "cosmos-mcp-toolkit-connection" }
+    }
     $script:RESOURCE_GROUP = "rg-eia-$Environment-$Suffix"
     $script:AI_FOUNDRY_RESOURCE_GROUP = $script:RESOURCE_GROUP
     $accountInfo = az account show -o json | ConvertFrom-Json
@@ -159,7 +174,8 @@ function Parse-Arguments {
     Write-Info "[OK] Using Microsoft Foundry Project: $script:AI_FOUNDRY_PROJECT_NAME"
     
     # Load deployment info file from same directory as script
-    $script:DEPLOYMENT_INFO_FILE = Join-Path $SCRIPT_DIR "deployment-info.json"
+    $infoFileName = if ($script:SERVER_NAME) { "deployment-info-$($script:SERVER_NAME).json" } else { "deployment-info.json" }
+    $script:DEPLOYMENT_INFO_FILE = Join-Path $SCRIPT_DIR $infoFileName
     if (-not (Test-Path $script:DEPLOYMENT_INFO_FILE)) {
         Write-Error-Message "Deployment info file not found: $script:DEPLOYMENT_INFO_FILE"
         exit 1
@@ -589,7 +605,7 @@ function Update-FoundryAgents {
     )
     $mcpTool = [pscustomobject]@{
         type = "mcp"
-        server_label = "cosmos-mcp"
+        server_label = if ($script:SERVER_NAME) { "cosmos-mcp-$($script:SERVER_NAME)" } else { "cosmos-mcp" }
         server_url = $script:MCP_SERVER_ENDPOINT
         require_approval = "always"
         project_connection_id = $ConnectionName
