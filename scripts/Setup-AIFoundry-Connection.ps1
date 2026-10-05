@@ -8,6 +8,7 @@
     2. Retrieves Microsoft Foundry project managed identity details
     3. Creates a managed identity connection in Microsoft Foundry for the Cosmos DB MCP Toolkit server
     4. Assigns the Entra App role to the Microsoft Foundry project managed identity
+    5. Prompts to add the MCP server as a tool to project agents or quit without changing agents
 
 .PARAMETER Environment
     Environment name used to construct the resource group (for example, dev)
@@ -786,6 +787,19 @@ function Main {
             exit 1
         }
     } else {
+        Write-Host ""
+        Write-Host "  [1] Add this MCP server as a tool to agents in the Foundry project"
+        Write-Host "  [2] Quit without changing agents"
+        do {
+            $agentSetupChoice = (Read-Host "Enter selection (1-2)").Trim()
+        } until ($agentSetupChoice -in @("1", "2"))
+
+        if ($agentSetupChoice -eq "2") {
+            Write-Info "Foundry connection setup completed. No agents were changed."
+            Show-Results
+            return
+        }
+
         Update-FoundryAgents
     }
     Show-Results

@@ -123,7 +123,12 @@ To create the Foundry project managed-identity connection after deployment, run 
 .\scripts\Setup-AIFoundry-Connection.ps1 -Environment dev -Suffix 1 -ServerName sales
 ```
 
-The script creates the `ProjectManagedIdentity` connection for the selected project, uses the deployed MCP URL from the matching `deployment-info-sales.json`, assigns the `Mcp.Tool.Executor` app role to the Foundry project managed identity, and configures the MCP audience as `api://<ENTRA_APP_CLIENT_ID>`. It then lists the agents in that project so you can select one or more. For each selected agent, it displays the existing instructions and lets you keep them, use the Cosmos DB example, enter a replacement, or load instructions from a UTF-8 text file. It attaches the MCP tool with approval required and an allow-list of the server's tools.
+The script creates the `ProjectManagedIdentity` connection for the selected project, uses the deployed MCP URL from the matching `deployment-info-sales.json`, assigns the `Mcp.Tool.Executor` app role to the Foundry project managed identity, and configures the MCP audience as `api://<ENTRA_APP_CLIENT_ID>`. After connection setup, it prompts you to choose:
+
+- `1`: Add this MCP server as a tool to agents in the Foundry project.
+- `2`: Quit without changing agents. The completed connection setup is retained, and the script displays its results before exiting.
+
+Choosing `1` lists the agents in that project so you can select one or more. For each selected agent, it displays the existing instructions and lets you keep them, use the Cosmos DB example, enter a replacement, or load instructions from a UTF-8 text file. It attaches the MCP tool with approval required and an allow-list of the server's tools. Invalid menu input prompts again.
 
 To apply the same multiline instructions to selected agents without an interactive instruction prompt:
 
@@ -131,7 +136,7 @@ To apply the same multiline instructions to selected agents without an interacti
 .\scripts\Setup-AIFoundry-Connection.ps1 -Environment dev -Suffix 1 -ServerName sales -AgentInstructionsFile .\scripts\cosmos-agent-instructions.example.txt
 ```
 
-To test a configured agent from the same script, add `-TestAgent`. The script prompts for the agent number and the prompt to send:
+To test a configured agent from the same script, add `-TestAgent`. This bypasses the add-to-agents-or-quit menu and proceeds directly to testing after connection setup. The script prompts for the agent number and the prompt to send:
 
 ```powershell
 .\scripts\Setup-AIFoundry-Connection.ps1 -Environment dev -Suffix 1 -ServerName sales -TestAgent
